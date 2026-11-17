@@ -1,0 +1,583 @@
+# TermGrid: сетка окон macOS с ресайзом ячеек мышью
+
+## TL;DR
+
+> **Суть**: menu bar приложение на Swift. Оно раскладывает реальные окна любых приложений (Terminal, iTerm2, браузер, редактор) по сетке через Accessibility API. Между окнами лежат тонкие разделители: их тянут мышью, и соседние окна меняют размер прямо во время движения.
+> **Результат**: SwiftPM-пакет с чистой библиотекой раскладки `GridCore` и тестами, приложение `TermGrid.app` (собирается скриптом), отладочная утилита `tgprobe` для агентской проверки и README.
+> **Объём**: Medium (11 шагов, 0-10).
+> **Параллельность**: да, 6 волн.
+> **Критический путь**: 0 → 1 → 4 → 6 → 7 → 8 → 10.
+
+---
+
+## Контекст
+
+### Исходный запрос
+"В этом репозитории надо написать простое приложение для MacOS которое позволило бы объединять терминалы или любые другие окна в сетку, чтобы можно было удобно их все открытыми расположить на экране и можно было бы менять ширину и высоту ячейки мышкой, а не как в похожих программах для терминала через хоткеи"
+
+### Решения пользователя (переданы координатором)
+- Во время перетаскивания разделителя окна меняют размер **сразу, вслед за мышью** (live resize), а не только после отпускания кнопки.
+- Screen Recording и ScreenCaptureKit не нужны, превью содержимого окон не делаем. Единственное разрешение TCC: **Accessibility**.
+- Для терминалов ячейки подстраиваются под размер символа. Отказ приложения принять запрошенный размер обрабатывается явно.
+
+### Что установлено исследованием (проверено на этой машине 2026-11-17)
+- Репозиторий пуст: `README.md` (11 байт), один коммит `e6eb9f4`.
+- Хост: macOS 26.5.2, Apple Swift 6.3.3, активны **только Command Line Tools** (`xcode-select -p` = `/Library/Developer/CommandLineTools`). `xcodebuild` недоступен: "requires Xcode". Поэтому сборка идёт через SwiftPM (`swift build`), а `.app` собирает скрипт.
+- SDK: `MacOSX26.5.sdk`. В нём есть `AppKit`, `SwiftUI`, `ApplicationServices` (HIServices/AX) и `Testing.framework`.
+- `swift test` со Swift Testing под CLT **без дополнительных флагов не работает** (`no such module 'Testing'`, затем `Library not loaded: @rpath/lib_TestingInterop.dylib`). Рабочая команда (проверена на пробном пакете):
+  ```
+  CLT=/Library/Developer/CommandLineTools
+  swift test -Xswiftc -F -Xswiftc $CLT/Library/Developer/Frameworks \
+    -Xlinker -rpath -Xlinker $CLT/Library/Developer/Frameworks \
+    -Xlinker -rpath -Xlinker $CLT/Library/Developer/usr/lib
+  ```
+- Внутри песочницы Claude Code `swift` падает: запись в module cache в `/var/folders/.../C/clang/ModuleCache` даёт "Operation not permitted". Сборку и тесты агент запускает **вне песочницы**. `open` и `osascript` в песочнице тоже заблокированы.
+- Подписей для кода нет: `security find-identity -v -p codesigning` выдаёт "0 valid identities found".
+- Заголовки AX в SDK (`HIServices.framework/Headers`):
+  - `kAXPositionAttribute`: начало координат (0,0) в верхнем левом углу экрана с меню-баром, ось y направлена вниз, единицы в points (`AXAttributeConstants.h:609-625`). В AppKit `NSScreen.frame` начинается снизу слева, поэтому нужна конверсия.
+  - Есть `AXIsProcessTrustedWithOptions` и `kAXTrustedCheckOptionPrompt` (`AXUIElement.h:55-66`), `AXObserverCreate` и `AXObserverAddNotification` (`AXUIElement.h:579-612`), `AXUIElementSetMessagingTimeout` (`AXUIElement.h:387-402`), `AXValueCreate` (`AXValue.h:84-94`).
+  - Уведомления: `kAXWindowCreatedNotification`, `kAXWindowMovedNotification`, `kAXWindowResizedNotification`, `kAXWindowMiniaturizedNotification`, `kAXUIElementDestroyedNotification` (`AXNotificationConstants.h:108-194`).
+  - `"AXFullScreen"` и `"AXEnhancedUserInterface"` **не являются публичными константами**. Это строковые атрибуты, которые используют известные оконные менеджеры (Rectangle, AeroSpace).
+  - `CGPreflightScreenCaptureAccess` существует (`CGWindow.h:295`), но нам он не нужен: заголовки окон берём из `kAXTitleAttribute`. Он не требует Screen Recording, в отличие от `kCGWindowName`.
+- Установлены iTerm2 и Terminal.app (системный).
+
+### Отчёт Metis (что учтено)
+- Главное допущение "раскладываем чужие окна, а не встраиваем свой терминал" зафиксировано (Д-0).
+- Минимальный зазор между окнами по умолчанию 8 pt: панель-разделитель лежит в зазоре и не перекрывает окна.
+- Эхо собственных `setFrame`: подавляем состоянием окна (запись в полёте, время completion, последняя фактическая рамка) и допуском (шаг 8).
+- Ручное перемещение управляемого окна: окно отвязывается от ячейки и показывается как "откреплено" (Д-9).
+- Отказ от размера и шаг символов: после установки рамка читается обратно, повторов не больше одного (шаг 6).
+- Порядок установки рамки: size → position → size (шаг 4).
+- AX-вызовы синхронные: таймаут и отдельная очередь на каждый PID (шаг 4).
+- Ре-подпись и TCC: spike в шаге 1 до основной работы.
+- Swift 6 strict concurrency против C-колбэков AX: язык для каждого target задаётся явно (Д-5).
+- Агент не может просто так подвигать мышь и проверить рамки, поэтому добавлена утилита `tgprobe` (шаг 1).
+- Scope creep: мультимонитор, drag-swap окон и встроенный терминал вынесены в не-цели. Персистенция оставлена последним, отрезаемым шагом.
+
+---
+
+## Цель и не-цели MVP
+
+### Цель
+Пользователь открывает меню TermGrid, выбирает пресет сетки (например 2×2) и назначает окна в ячейки. Окна встают в ячейки. Затем пользователь мышью тянет разделитель между ячейками, и окна по обе стороны меняют ширину или высоту в реальном времени.
+
+### Обязательно в MVP
+- Обнаружение окон всех обычных приложений через AX: приложение, иконка, заголовок, возможность менять размер.
+- Сетка как дерево сплитов: пресеты, разбиение ячейки по горизонтали или вертикали, закрытие ячейки.
+- Назначение окна в ячейку из меню; кнопка "Разложить выбранные окна автоматически" (без ручного назначения).
+- Живой ресайз мышью: вертикальные и горизонтальные разделители с курсором resize и минимальным размером ячейки.
+- Подгонка под шаг символов терминала и корректная обработка окон, которые не принимают размер.
+- Отслеживание закрытия и сворачивания окон, ручного перемещения, завершения приложений и смены параметров экранов.
+- Онбординг разрешения Accessibility.
+
+Отрезаемо: сохранение и восстановление раскладки (шаг 9, Д-10).
+
+### Не-цели (Must NOT Have)
+- Превью окон, ScreenCaptureKit, Screen Recording.
+- Хоткеи как основной способ управления (горячих клавиш в MVP нет вообще).
+- Встроенный терминал (PTY, SwiftTerm).
+- Несколько сеток одновременно и сетка на несколько мониторов. Сетка одна, на выбранном экране.
+- Перенос окон между Spaces и управление полноэкранными окнами.
+- Автоматическое помещение в сетку новых окон (авто-тайлинг в стиле i3).
+- Перетаскивание окна в другую ячейку (drag-swap). Это v2.
+- App Store, App Sandbox, нотаризация, Developer ID. Только локальная сборка.
+- Приватные API (`_AXUIElementGetWindow`, CGS/SkyLight).
+- Плагинные абстракции, протоколы "на будущее", лишняя валидация.
+- Комментарии в коде любого вида (см. "Правила проекта").
+
+---
+
+## Правила проекта (обязательны для каждого шага)
+
+1. **В коде НЕ пишем комментариев**: ни пояснительных, ни TODO/NOTE, ни заголовков секций, ни docstring-нарратива. Это касается Swift, shell-скриптов и тестов. Исключение составляют машинные директивы: shebang `#!/bin/bash` и `// swift-tools-version:` в `Package.swift`, без которой SwiftPM не работает. Проверка: `scripts/check-no-comments.sh` (шаг 0).
+2. **Коммиты** без `Co-Authored-By` и без строк "Generated with Claude Code". Один шаг даёт один коммит в формате `type(scope): описание`.
+3. **Полный тестовый набор локально не запускаем.** Запускаем только тесты, которые покрывают изменение (`--filter <Suite>`), и проверку запуска приложения. Полный набор относится к CI. CI пока нет, и это вне MVP.
+4. **Artifact tool не используем.** Все документы лежат в репозитории (`docs/`).
+5. Агент запускает `swift build` и `swift test` вне песочницы Claude Code (см. исследование). `open build/TermGrid.app` тоже идёт вне песочницы или его запускает пользователь.
+
+---
+
+## Выбранный подход и обоснование
+
+| Вопрос | Решение | Почему |
+|---|---|---|
+| Что объединяем | Реальные окна любых приложений через AXUIElement | Пользователь просит "терминалы или любые окна" и "все открытыми": окна остаются живыми и интерактивными. Превью через ScreenCaptureKit не интерактивно, его исключил пользователь. |
+| Механизм перемещения | `AXUIElementSetAttributeValue` с `kAXPositionAttribute`/`kAXSizeAttribute` | Единственный публичный способ двигать чужие окна. Так же устроены Rectangle, Amethyst и AeroSpace. |
+| Ресайз мышью | Прозрачные non-activating `NSPanel` в зазорах между окнами над каждым разделителем | Мы не можем перехватить край чужого окна. Своя панель надёжно ловит drag и ставит курсор. Прямоугольник панели равен зазору между соседними окнами и не заходит на окна. |
+| Модель сетки | N-арное дерево сплитов (контейнер с осью и долями детей, лист = ячейка) | Позволяет менять ширину одной ячейки, не трогая ячейки в других рядах. Равномерная таблица строк и столбцов так не умеет, а "менять ширину и высоту ячейки" как раз этого требует. Пресеты — это заранее построенные деревья. |
+| Язык и сборка | Swift 6.3 + SwiftPM, AppKit + SwiftUI `MenuBarExtra` | Нативно. Xcode отсутствует, но SwiftPM с CLT собирает и тестирует (проверено). |
+| Минимальная macOS | 14 (Sonoma) | `MenuBarExtra` и `@Observable` доступны, поддержка свежая. Хост на 26.5. |
+| Разрешения | Только Accessibility | Заголовки берём из AX, захват экрана не нужен. |
+| Распространение | Локально, ad-hoc подпись или self-signed сертификат | Отсутствие App Sandbox обязательно: AX не может управлять чужими окнами из песочницы, App Store исключён. |
+
+---
+
+## Архитектура
+
+### Структура репозитория (создаётся в шагах)
+```
+Package.swift
+Sources/GridCore/            чистая логика, без AppKit/AX, Swift 6 mode
+  LayoutTree.swift           CellID, Axis, LayoutNode (container/leaf), Codable
+  LayoutOps.swift            split, close, presets, autoLayout(n)
+  FrameSolver.swift          дерево + прямоугольник + gap + minSize → [CellID: CGRect]
+  Dividers.swift             геометрия разделителей, moveDivider(delta) с клампом
+  ScreenSpace.swift          конверсия AppKit (bottom-left) ↔ AX (top-left)
+  FitPolicy.swift            подгонка ячейки под фактический размер окна
+  EchoFilter.swift           pending, lastActual, допуск (чистый тип, владелец GridController)
+  LayoutSnapshot.swift       сериализуемое состояние + подсказки привязки окон
+Sources/TermGrid/            приложение, Swift 5 language mode
+  TermGridApp.swift          @main, MenuBarExtra, Settings
+  Permissions.swift          AXIsProcessTrustedWithOptions, опрос статуса, ссылка в Настройки
+  AXWindow.swift             обёртка AXUIElement: title, frame, settable, minimized, fullscreen
+  WindowDiscovery.swift      NSWorkspace.runningApplications → окна
+  WindowMover.swift          очередь на PID, таймаут, size→pos→size, readback, троттлинг
+  AXEventMonitor.swift       AXObserver на приложение, уведомления → события
+  GridController.swift       @MainActor состояние сетки, привязки, apply, реакции на события
+  DividerPanel.swift         NSPanel + NSView: курсор, drag
+  DividerOverlay.swift       набор панелей, синхронизация с Dividers
+  MenuContent.swift          SwiftUI: пресеты, список окон, назначение, gap, статусы
+  LayoutPersistence.swift    JSON в ~/Library/Application Support/TermGrid/
+Sources/tgprobe/main.swift   CLI: list / set-frame / bench / drag / state
+Tests/GridCoreTests/         Swift Testing, только GridCore
+Resources/Info.plist
+scripts/build-app.sh scripts/test.sh scripts/check-no-comments.sh
+docs/plans/window-grid.md docs/spike-results.md README.md .gitignore
+```
+
+### Поток данных
+```
+MenuContent ──команды──▶ GridController (@MainActor, единственный владелец состояния)
+                           │  LayoutNode + bindings[CellID: WindowRef] + actualFrames
+                           │
+          FrameSolver ◀────┤────▶ DividerOverlay (панели в зазорах)
+          (GridCore)       │            │ mouseDragged(delta)
+                           │            ▼
+                           │      Dividers.moveDivider → новый LayoutNode
+                           │            │
+                           ▼            ▼
+                  WindowMover (serial DispatchQueue "termgrid.ax.<pid>" на каждый PID, троттлинг, коалесценция)
+                           │ AXUIElementSetAttributeValue size→pos→size, readback
+                           ▼
+                  ApplyResult(requested, actual, error) ─▶ GridController ─▶ FitPolicy
+AXEventMonitor (AXObserver на main run loop, без AX-вызовов) ─▶ GridController ─▶ чтение рамки в очереди PID ─▶ EchoFilter
+NSWorkspace didTerminateApplication / NSApplication.didChangeScreenParameters ─▶ GridController
+```
+
+### Обнаружение окон
+- `NSWorkspace.shared.runningApplications`, фильтр `activationPolicy == .regular`, свой PID исключаем.
+- Для каждого PID: `AXUIElementCreateApplication(pid)` → `kAXWindowsAttribute`.
+- Окно подходит, если `kAXRoleAttribute == kAXWindowRole`, `kAXSubroleAttribute == kAXStandardWindowSubrole`, `kAXMinimizedAttribute == false`, `"AXFullScreen" != true`, а `AXUIElementIsAttributeSettable(kAXPositionAttribute)` возвращает true. Если size не settable, окно всё равно показывается, но с пометкой "фиксированный размер".
+- Отображение: иконка `NSRunningApplication.icon`, имя приложения и `kAXTitleAttribute`. Пустой заголовок заменяется на "Без названия".
+- Окна других Spaces AX обычно не возвращает. В список они не попадают, это ожидаемо (риск R-5).
+- `WindowDiscovery.snapshot()` выполняется вне main: меню сразу показывает последний снимок и обновляется, когда приходит новый.
+
+### Перемещение окна (WindowMover)
+- Все AX-записи и чтения идут вне main thread, на отдельной последовательной очереди `termgrid.ax.<pid>` для каждого PID: она создаётся при первом управляемом окне PID и удаляется при terminate. Зависшее приложение не замораживает UI и не блокирует окна других приложений. Ни записи, ни чтения AX не выполняются на main thread; исключение — только `AXObserverCreate` и `CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(...))`. `AXObserverAddNotification` и `AXObserverRemoveNotification` выполняются в очереди `termgrid.ax.<pid>`. Если регистрация destroyed или miniaturized для окна вернула `kAXErrorCannotComplete`, в лог пишется `observe incomplete window=<key>`, а регистрация повторяется в очереди PID перед следующей записью в это окно. Коалесценция last-write-wins идёт по окну внутри очереди своего PID, completion вызывается на main.
+- Таймаут: при старте один раз `AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), T)` — глобальный предел для всех AX-вызовов процесса (обнаружение, элементы из колбэков AXObserver, чтения). Дополнительно тот же T ставится на каждый элемент окна при создании `AXWindow` и на элемент приложения, который использует `WindowMover`, потому что значение на объекте не распространяется на равные ему объекты (`AXUIElement.h:387-402`). T по умолчанию 0.25 s, окончательное значение записывается по результатам spike b в `docs/spike-results.md`. Таймаут распознаётся как `kAXErrorCannotComplete`.
+- Порядок записи при `final: true`: полный цикл size → position → size с readback и `ApplyResult`. Второй size отправляется, только если прочитанный размер отличается от запрошенного больше чем на 1 pt. Иначе приложения клампят размер к краю экрана.
+- `request(final: false)`: одна пара записей без readback и без второго size. Порядок по оси drag: если окно вдоль оси растёт, сначала position, потом size; если сжимается, сначала size, потом position.
+- Первый `kAXErrorCannotComplete` в любом AX-вызове попытки записи окна (size, position, второй size, readback) прерывает попытку: остальные вызовы не выполняются, результат `status=timeout`. Повтор на `final: true` (см. "FitPolicy") — единственная вторая попытка.
+- Для приложений, у которых `"AXEnhancedUserInterface"` (EUI) равен true (Chromium/Electron), атрибут выключается один раз на PID в начале операции (исходное значение запоминается, выключение только если оно было true) и восстанавливается один раз в конце операции. Иначе запись анимируется и тормозит. Так делает Rectangle. Операция — жест drag (начало: mouseDown, до первой записи `final: false`; конец: completion записи `final: true` на mouseUp, включая её единственный повтор при таймауте, и, если FitPolicy вернула новое дерево, completion fit-записей; либо отмена жеста) либо полный apply из меню (начало: перед первой записью в окна PID; конец: completion последней записи этого PID, включая fit-записи после полного apply). EUI восстанавливается один раз после последней из этих записей, поэтому fit-записи и их readback идут при выключенном EUI. Внутри `request(final: false)` EUI не трогается. При выходе TermGrid (`applicationWillTerminate`) EUI восстанавливается для всех PID, где он был выключен; при завершении целевого приложения запомненное значение отбрасывается. Если чтение EUI в начале операции получило таймаут, EUI для этого PID в операции не трогается и в конце не восстанавливается.
+- Readback: после записи читаются `kAXPositionAttribute` и `kAXSizeAttribute`, возвращается `ApplyResult { requested, actual, status: ok | clamped | refused | timeout | invalidElement | superseded }`, где `generation` — поколение запроса (см. ниже).
+- **Троттлинг live-ресайза** (решение пользователя): у каждого окна не больше одной операции в полёте. Пока она выполняется, новые запросы заменяют "ожидающую" рамку, промежуточные выбрасываются (коалесценция по принципу last-write-wins). Запросы идут не чаще `maxApplyHz` (по умолчанию 30), и этот предел применяется к каждому окну отдельно, а не глобально. Окончательное значение выбирает spike b в шаге 1 (формула и правило свода по приложениям — в пункте b шага 1). На mouseUp последняя рамка применяется всегда.
+- **generation и completion**: `generation` — монотонный счётчик на окно; GridController увеличивает его на каждый `request` и хранит `latestGeneration[window]`. `WindowMover` вызывает completion ровно один раз на каждый принятый `request`; запрос, вытесненный коалесценцией, получает `status=superseded` без AX-вызовов. GridController обрабатывает completion (`markCompleted`, статус ячейки, `minSize`, FitPolicy) только если `result.generation == latestGeneration[window]` и окно всё ещё привязано к той же ячейке; остальные completion только логируются.
+
+### Ресайз ячеек мышью
+- `Dividers.compute(tree, frames)` выдаёт список `Divider { id: (containerID, index), axis, rect }`. Прямоугольник занимает зазор между соседними детьми контейнера и тянется на всю длину контейнера.
+- `DividerOverlay` держит одну `DividerPanel` на каждый разделитель. Параметры панели: `styleMask [.borderless, .nonactivatingPanel]`, `isOpaque=false`, фон почти прозрачный (alpha 0.01, иначе клики проходят насквозь), `level = .normal` (если spike d подтвердил; иначе `.floating`, см. spike d), `collectionBehavior [.ignoresCycle, .fullScreenNone]`, `hidesOnDeactivate=false`, `canBecomeKey=false`, `canBecomeMain=false`. Hit-зона панели равна `gap`: прямоугольник панели совпадает с зазором между соседними рамками и не заходит на окна. `DividerOverlay` вызывает `orderFrontRegardless()` у всех панелей после каждой перестановки панелей и по `NSWorkspace.didActivateApplicationNotification`, если у активированного приложения есть управляемые окна. Неуправляемое окно, поднятое поверх сетки, закрывает панель там, где перекрывает её, и клик уходит в него.
+- У view внутри панели `acceptsFirstMouse` возвращает true. Курсор ставится через `NSTrackingArea [.mouseEnteredAndExited, .activeAlways, .inVisibleRect]` и `NSCursor.resizeLeftRight` / `resizeUpDown` в `mouseEntered`. `cursorUpdate` для неключевого окна не срабатывает, поэтому полагаться на него нельзя. Запасной путь (выбирается по результату spike d, CGS не используется): если курсор не меняется, `DividerPanel` в `mouseEntered` поднимает alpha фона до 0.3, а в `mouseExited` и после `mouseUp` возвращает 0.01.
+- Drag: в `mouseDown` запоминается исходное дерево. В `mouseDragged` суммарное смещение даёт `moveDivider(tree, dividerID, delta, minCell)`, получается новое дерево, затем `FrameSolver`, затем `WindowMover.request` для **двух соседних поддеревьев** (остальные окна не трогаются), затем перестановка панелей. В `mouseUp` идут финальный apply, `FitPolicy` и сохранение.
+- Минимальная ячейка по умолчанию 120×80 pt. Если окно сообщило фактический минимум больше (ApplyResult.clamped), clamp учитывает его.
+
+### Шаг символов терминалов и отказ от размера (FitPolicy)
+- Terminal.app и iTerm2 округляют размер до целого числа символов, поэтому фактический размер обычно меньше запрошенного на величину до одной ячейки символа.
+- **Подгонка (по умолчанию включена, настройка "Подгонять ячейку под окно")**: после mouseUp для разделителя, который тянули, сравниваются фактические рамки двух соседних окон вдоль оси drag. Если окно меньше ячейки (дефицит больше 1 pt и меньше 40 pt), дефицит окна вдоль оси — разность размера ячейки и фактического размера окна (по размеру, не по позиции). Дефицит разделителя — минимум дефицитов окон ближнего (left/top) поддерева, чьи ячейки прилегают к разделителю; дальнее поддерево не учитывается. Если этот минимум не больше 1 pt или не меньше 40 pt, разделитель не двигается. Иначе разделитель сдвигается к ближнему поддереву на величину минимума, а соседняя ячейка получает освободившееся место. В итоге между окнами не остаётся пустых мест: в ряду и в столбце окна стоят вплотную. Подгонка касается только внутренних разделителей; внешняя граница сетки (у края экрана) остаётся там, куда её выставил пользователь, и лишнее место у края допустимо. Во время drag подгонка не выполняется, иначе разделитель дёргается.
+- **Размещение окна, не добравшего размер** (без хранимого состояния): в каждом `request(final: true)` GridController передаёт, какие края ячейки являются внешней границей сетки (вычисляется из дерева). `WindowMover` после readback проверяет каждую ось. Если фактический размер меньше запрошенного больше чем на 1 pt и ровно один из двух краёв ячейки по этой оси внешний, `WindowMover` дописывает position так, чтобы окно прилегало к внутреннему краю, и повторяет readback. Это часть той же попытки до completion, `lastActual` берётся из последнего readback. Если оба края по оси внутренние, окно остаётся у начала ячейки, а в лог пишется `fit residual cell=<id> pt=<n>`. Расчёт позиции — чистая функция GridCore `FitPolicy.anchoredOrigin(cell, actualSize, outerEdges)`.
+- **Fit-запись**: подгонка — обычный `WindowMover.request(final: true)` (size, position, size с readback) для окон двух соседних поддеревьев; выполняется один раз за операцию, рамки после неё повторно не подгоняются. GridController пишет в лог `fit adjusted divider=<id> delta=<d>`, если FitPolicy вернула дерево, или `fit skipped divider=<id>`, если nil.
+- **Окно больше ячейки** (минимальный размер приложения): этот минимум запоминается как `minSize` окна, разделитель не даёт сделать ячейку меньше.
+- **Отказ** (`refused`: size не settable или AX вернул ошибку): окно ставится в левый верхний угол ячейки со своим размером, ячейка помечается "не вписывается", в меню рядом с окном появляется значок. Повтор только один, на следующем полном apply, бесконечных ретраев нет.
+- **Timeout** (`kAXErrorCannotComplete`) никогда не отвязывает окно. На `final: false` таймаут только выбрасывает тик. На `final: true` запись повторяется один раз сразу; при повторном таймауте ячейка получает статус `notResponding` (в меню значок и пункты "Повторить" и "Убрать из ячейки"), привязка сохраняется, запись повторяется на следующем полном apply или по пункту меню. Если приложение исполнило отложенную запись после восстановления, уведомление классифицируется как `recovered`: GridController не открепляет окно, а ставит для него `request(final: true)` на рамку его ячейки; при `status=ok` ячейка получает `cell status=ok`. Этот же путь закрывает и частичное исполнение (только size без position).
+- **invalidElement** (`kAXErrorInvalidUIElement`) освобождает ячейку, как destroyed; событие пишется в лог.
+
+### Реакция на внешние события (AXEventMonitor + EchoFilter)
+- Один `AXObserver` на PID с управляемыми окнами, источник в main run loop. На элемент приложения (`AXUIElementCreateApplication(pid)`) регистрируются `kAXWindowMovedNotification` и `kAXWindowResizedNotification`; колбэк получает элемент окна, его сопоставляют с привязкой через `CFEqual`, непривязанные окна игнорируются. При назначении окна в ячейку на сам элемент окна регистрируются `kAXUIElementDestroyedNotification` и `kAXWindowMiniaturizedNotification` с refcon `UnsafeMutableRawPointer(bitPattern: bindingID)`, где `bindingID` — монотонный счётчик `GridController`, начиная с 1 и без повторного использования (атрибуты уничтоженного окна не читаются). Колбэк восстанавливает его через `Int(bitPattern: refcon)` и передаёт в `GridController`, который ищет его в словаре `[Int: WindowKey]` текущих привязок; неизвестный id игнорируется. При освобождении ячейки запись удаляется из словаря вместе с `AXObserverRemoveNotification` для этих двух, даже если Remove вернул ошибку. `AXObserverAddNotification` и `AXObserverRemoveNotification` выполняются в очереди PID. Так устроен yabai (`application.c` `application_observe`, `window.c` `window_observe`).
+- Колбэк `AXObserver` на main не вызывает AX: он передаёт `(windowKey, notification)` в `GridController`. Если у окна есть запись в полёте или ожидающая, уведомление сразу считается эхом без чтения. Иначе чтение рамки ставится в очередь PID этого окна, рамка возвращается на main и только там идёт в `EchoFilter`.
+- **Эхо**: `EchoFilter` — чистый тип `GridCore`, которым владеет только `GridController` на main. Состояние на окно: `pending` (true с момента `request` на main до completion последней записи окна) и `lastActual` с временем completion. Уведомление moved/resized — эхо, если `pending`, или если с completion прошло меньше 250 ms, или если текущая рамка совпадает с `lastActual` в пределах 2 pt. Иначе уведомление не эхо. Таймаут означает «исход неизвестен»: сообщение уже лежит в очереди целевого приложения, и оно может исполнить запись после восстановления (SIGCONT, выход из подвисания). Поэтому `EchoFilter` помнит последний исход окна: `markTimedOut(window)` вызывается, когда completion вернул `status=timeout`, а следующий `markCompleted` возвращает обычные правила. `classify(window, current, at)` возвращает `echo`, `external` или `recovered`. Для окна, у которого последний исход `timeout` (в том числе ячейка `notResponding`), любое не-эхо уведомление даёт `recovered`, а не `external`. Во всех остальных случаях не-эхо уведомление — `external` (дальше правило 20 pt). `echo` игнорируется, `recovered` не отвязывает окно (см. «Timeout» в FitPolicy).
+- **Ручное перемещение** (не эхо, смещение больше 20 pt): окно отвязывается, ячейка показывается как "откреплено", в меню есть действие "Вернуть в сетку". Остальные окна не трогаются.
+- **Ручной ресайз окна за его собственный край** (не эхо, размер изменился больше чем на 20 pt по любой оси): окно откреплено, см. Д-15. Синхронизация с разделителем отложена в v2.
+- Destroyed или miniaturized: ячейка пустеет. `NSWorkspace.didTerminateApplicationNotification` освобождает все ячейки этого PID и удаляет observer.
+- `NSApplication.didChangeScreenParametersNotification`: если выбранного экрана больше нет, сетка переносится на `NSScreen.main`, затем полный пересчёт и apply.
+
+### Координаты
+- Прямоугольник сетки берётся из `screen.visibleFrame` (AppKit, начало снизу слева), из него вычитается внешний отступ, равный gap.
+- `ScreenSpace.toAX(rect, primaryHeight)` даёт `CGRect(x: r.minX, y: primaryHeight - r.maxY, ...)`, где `primaryHeight = NSScreen.screens[0].frame.height` (экран с меню-баром). Обратная функция `fromAX` устроена так же. Формулы покрываются тестами, включая экраны с отрицательными координатами, хотя сетка в MVP одна.
+- Панели-разделители живут в координатах AppKit, окна в координатах AX. Конверсия делается только в `GridController` перед вызовом `WindowMover`.
+
+---
+
+## Допущения (пользователь может переопределить)
+
+| ID | Допущение | Что изменится при отказе |
+|---|---|---|
+| Д-0 | Раскладываем чужие окна, а не делаем свой терминал с панелями | Другая архитектура: SwiftTerm, PTY, без AX |
+| Д-1 | Сетка одна и на одном выбранном экране | Мультимонитор потребует набора деревьев по экранам |
+| Д-2 | Окна в ячейки назначаются через меню, drag-swap в v2 | Drag-swap потребует отслеживать перетаскивание заголовка окна |
+| Д-3 | Хоткеев нет совсем | Добавить глобальные хоткеи без доступа к входу нельзя: нужен Carbon `RegisterEventHotKey` |
+| Д-4 | Минимальная macOS 14 | 13 требует отказа от `@Observable` |
+| Д-5 | `GridCore` в Swift 6 language mode, `TermGrid` и `tgprobe` в Swift 5 mode | Strict concurrency с C-колбэками AXObserver потребует `@unchecked Sendable`-обёрток |
+| Д-6 | Зазор 8 pt по умолчанию (настраивается от 4 до 16), без зазора 0. При зазоре 4 pt hit-зона разделителя шириной 4 pt | При gap=0 панели пришлось бы класть поверх окон |
+| Д-7 | Пресеты: 2 колонки, 3 колонки, 2 ряда, 2×2, 1+2 (большая слева и две справа), 2×3 | Список легко расширить |
+| Д-8 | Минимальная ячейка 120×80 pt | Настройка |
+| Д-9 | Ручное перемещение окна отвязывает его, а не возвращает обратно на место | Можно сделать snap back |
+| Д-10 | Персистенция сохраняет дерево, доли, gap, экран и подсказки привязки (bundleId + title). Восстановление best-effort, по кнопке | Можно отрезать весь шаг 9 |
+| Д-11 | Bundle id `local.termgrid.TermGrid`, имя `TermGrid`, LSUIElement (без иконки в Dock) | Косметика |
+| Д-12 | Подпись: self-signed сертификат "TermGrid Dev" (пользователь создаёт его один раз в Keychain Access), запасной вариант ad-hoc `-s -` со сбросом TCC | См. R-1 |
+| Д-13 | Частота live-apply 30 Hz по умолчанию на окно, финальное значение задаёт spike b по порогу: p95 времени круга пар size+position по четырём окнам одного приложения (`tgprobe bench --windows 4`, k=4, grid2x2) не выше 66 ms, то есть не меньше 15 Hz на окно, для Terminal и iTerm2 (шаг 1, spike b); результаты для k=1, 2 и 6 только записываются | — |
+| Д-14 | Подгонка под шаг символов включена по умолчанию | Настройка |
+| Д-15 | Ручной ресайз управляемого окна за его собственный край (не эхо, размер изменился больше чем на 20 pt по любой оси; сюда же попадает смена шрифта в терминале) открепляет окно, как Д-9. Размер ячейки меняется только разделителем | Изменение края, смежного с разделителем, переводится в `moveDivider` (v2) |
+
+---
+
+## Риски
+
+| ID | Риск | Митигирование |
+|---|---|---|
+| R-1 | **TCC Accessibility привязан к подписи.** При ad-hoc подписи cdhash меняется с каждой сборкой, и грант может перестать действовать, хотя переключатель в Настройках включён | Spike в шаге 1 проверяет это. Предпочтителен стабильный self-signed сертификат. Запасной вариант: `tccutil reset Accessibility local.termgrid.TermGrid` и повторная выдача права. В README описаны оба пути |
+| R-2 | **TCC при запуске из терминала.** Если бинарь `Contents/MacOS/TermGrid` запустить прямо из iTerm, право проверяется у iTerm (ответственного процесса), а не у TermGrid | Запускать только через `open build/TermGrid.app`. AX-замеры тоже идут внутри приложения (`--probe`), право терминалу не нужно |
+| R-3 | **Поведение AX-ресайза на macOS 26** (задержки, анимации, разная скорость приложений) при live-ресайзе | Spike `tgprobe bench` измеряет латентность записи для Terminal, iTerm2 и одного браузера. Троттлинг и коалесценция по окну, финальный apply на mouseUp, таймаут T (по умолчанию 0.25 s; system-wide, на элементе приложения и на каждом окне), очередь на каждый PID |
+| R-4 | **Шаг символов терминалов** оставляет дыры, приложения с минимальным размером не влезают | FitPolicy (подгонка после mouseUp), запоминание minSize, пометка "не вписывается" |
+| R-5 | **Spaces и полноэкранный режим.** AX не видит окна других Spaces и не умеет переносить их. Полноэкранные окна живут в отдельном Space | Окна с `AXFullScreen` исключаются из списка. Панели живут на том Space, где показана сетка, и вместе с её окнами не видны на других Spaces |
+| R-6 | **Multi-monitor.** Формулы координат дают ошибки на вторичных экранах | Сетка только на одном экране, тесты `ScreenSpace` с отрицательными координатами, реакция на отключение экрана |
+| R-7 | **Non-activating panel и мышь.** События могут не приходить или фокус может уходить из терминала | `acceptsFirstMouse`, `canBecomeKey=false`, alpha 0.01. Проверка в spike: после drag фокус остаётся у терминала (`kAXFocusedApplicationAttribute` у system-wide элемента не меняется) |
+| R-8 | **Петля эха** setFrame → уведомление → реакция | EchoFilter (pending, окно 250 ms после completion, допуск ±2 pt от lastActual), тесты на EchoFilter |
+| R-9 | **Зависшее приложение** блокирует AX | Таймаут T (system-wide, на элементе приложения и на каждом элементе окна), по одной очереди на PID вне main thread, первый timeout прерывает попытку записи. Timeout не отвязывает окно: на `final: false` тик выбрасывается, на `final: true` один повтор, затем статус `notResponding` с сохранением привязки |
+| R-10 | **Сборка без Xcode.** Флаги Swift Testing под CLT хрупкие | Флаги закреплены в `scripts/test.sh`. При обновлении CLT скрипт сначала проверяет пути |
+| R-11 | **Песочница агента.** `swift`, `open` и `osascript` в ней не работают | Агент выполняет `swift` и скрипты вне песочницы. `open` и `osascript` пользователь запускает сам по команде агента. Сценарии, которым нужен грант Accessibility, выполняются внутри `TermGrid.app` (`--probe`, `--selftest-*`), грант выдаётся только приложению. Без гранта шаг возвращает BLOCKED и просит у пользователя одно действие |
+| R-12 | **Панель-разделитель перехватывает клики в полосе зазора поверх неуправляемых окон** и курсор ↔ из неактивного приложения не гарантирован (spike d: `matchesResizeLeftRight=false`) | Запасной вариант: подсветка разделителя по `mouseEntered`/`mouseExited`; уровень панели и поведение по Spaces проверяются в шаге 7 |
+
+---
+
+## Стратегия проверки
+
+### Тесты
+- **Инфраструктура**: Swift Testing через `scripts/test.sh` с флагами CLT.
+- **Подход**: тесты пишутся вместе с кодом `GridCore` (tests-after в пределах того же шага). AX и UI не покрываются юнит-тестами и проверяются сценариями через `tgprobe` и логи.
+- **Только scoped-тесты**: `scripts/test.sh --filter <SuiteName>`. Полный набор локально не запускаем, даже если сейчас он маленький. Это норма команды.
+- **Допуск ±1 символ**: для окон Terminal и iTerm2 разница по ширине не больше `charW`, по высоте не больше `charH`, где `charW` и `charH` — максимальный дефицит по соответствующей оси из spike c (`docs/spike-results.md`), записанный для профиля, активного во время проверки. Для окон остальных приложений допуск ±2 pt. Значения `charW` и `charH` записываются в evidence каждого критерия, использующего допуск.
+
+### Сборка и запуск
+- `xcodebuild` недоступен (нет Xcode), поэтому используем только `swift build`.
+- `scripts/build-app.sh [debug|release]` собирает `swift build -c <cfg> --product TermGrid`, кладёт бинарь в `build/TermGrid.app/Contents/MacOS/TermGrid`, копирует `Resources/Info.plist` в `Contents/Info.plist` и подписывает: `codesign --force --sign "${TERMGRID_SIGN_IDENTITY:--}" build/TermGrid.app`.
+- Без аргумента `scripts/build-app.sh` собирает debug; release собирается только явным аргументом `release` (шаг 10 критерий 0, F2, "Критерии успеха"). Обработка всех флагов `--selftest-*` компилируется только под `#if DEBUG`, поэтому любой критерий приёмки или QA, в котором есть флаг `--selftest-*` (в том числе шагов 4, 6, 8, 9 и F3), выполняется на сборке `scripts/build-app.sh debug`.
+- Запуск любого selftest: сначала `pkill -x TermGrid; while pgrep -x TermGrid; do sleep 0.2; done`, затем `open build/TermGrid.app --args --selftest-...`, потому что `open` не передаёт `--args` уже запущенному TermGrid. `open -n` не используется, внутренний бинарь напрямую не запускается. Критерии шагов 4, 6 и 9 запускают selftest по этому правилу.
+- Флаг `--selftest-stop <bundleId>` (только под `#if DEBUG`) задаёт фиксированный порядок: обнаружение и привязка (для `--selftest-arrange` сначала полная раскладка), лог `selftest stopped pid=<n>`, SIGSTOP, тело selftest (для `--selftest-arrange` — операция `stoppedReapply`: один полный apply с `final: true`, с `beginOperation`/`endOperation`, только для ячеек, привязанных к окнам остановленного PID, на рамки из текущего дерева; запись выполняется безусловно, даже если рамка совпадает с `actualFrames`; ячейки других PID в теле не пишутся; с `--selftest-discover` тело дополнительно выполняет одно обновление снимка `WindowDiscovery`; тело с `--selftest-stop` удерживает остановку не меньше 5 s от SIGSTOP, SIGCONT отправляется после завершения тела, но не раньше 5 s и не позже 10 s от SIGSTOP; в лог тела пишется строка `selftest body=stoppedReapply`), SIGCONT, лог `selftest continued pid=<n>`, фаза после возобновления (только для arrange: один вызов `reapply`), выход. Окно между SIGSTOP и SIGCONT не дольше 10 s: по истечении SIGCONT отправляется, даже если тело не закончилось. Для `--selftest-discover` вместе с `--selftest-stop` SIGCONT отправляется ровно через 6 s после строки `selftest stopped` (снимок выполняется в начале этого окна), лимит 10 s сохраняется; `reapply` фазы после возобновления идёт только после `selftest continued`. Страховочный `kill -CONT` для PID остановленного приложения после selftest остаётся.
+- Флаги `--selftest-move` и `--selftest-arrange` принимают кроме bundleId форму `pid:<n>`, потому что у `tgprobe` нет bundleId.
+- Флаг `--selftest-arrange <list>` без `--selftest-stop` после раскладки не выходит: процесс продолжает работать с панелями и observer до `pkill -x TermGrid`. С `--selftest-stop` порядок прежний, со строкой выше про `--selftest-stop`.
+- Флаг `--selftest-preset <twoColumns|threeColumns|twoRows|grid2x2|onePlusTwo|grid2x3>` (только под `#if DEBUG`), по умолчанию `twoColumns`; ячейки заполняются по порядку списка `--selftest-arrange`.
+- Повтор bundleId в списке `--selftest-arrange` берёт следующее по индексу `kAXWindowsAttribute` окно этого приложения: k-е вхождение — окно с индексом k-1.
+- Флаг `--selftest-discover` (только под `#if DEBUG`): тело selftest при `--selftest-stop` (или сразу после привязки без него) один раз вызывает `WindowDiscovery.snapshot()` вне main; по завершении снимка на main пишется `windows discovered count=<N>`.
+- Проверка запуска: `open build/TermGrid.app`, затем `sleep 3`, затем `pgrep -x TermGrid` возвращает PID. `log show --last 1m --predicate 'subsystem == "local.termgrid"'` не содержит записей уровня fault или error, кроме "accessibility not trusted", если грант ещё не выдан.
+- Логи приложения: `os.Logger(subsystem: "local.termgrid", category: "apply"|"events"|"ui")`. Каждый apply пишет `apply final=<true|false> reason=<live|drag|fit|apply> cell=<id> requested=<rect> actual=<rect> status=<s>`: `live` — `final: false` во время drag, `drag` — `final: true` на mouseUp, `fit` — fit-запись, `apply` — полный apply из меню. Это evidence для агентских сценариев.
+
+### tgprobe (утилита для агентской проверки)
+Подкоманды:
+- `list [--bundle <id>]`: JSON со списком окон (pid, bundleId, title, frame в AX-координатах, role, subrole, positionSettable, sizeSettable).
+- `set-frame --bundle <id> --index <n> x y w h`.
+- `bench --bundle <id> --count 60 [--windows <k>]`: латентность записи size и время пары size+position (p50, p95, max в мс). С `--windows <k>` по кругу пишет пару size+position в k окон этого bundleId и меряет время круга (p50, p95, max).
+- `drag x1 y1 x2 y2 --steps <n> --duration-ms <ms> [--sample <bundleId>]`: синтетический drag через `CGEvent` (mouseDown, затем n событий mouseDragged равномерно с паузой ms/n, затем mouseUp), координаты глобальные AX. `--duration-ms` по умолчанию 1000. Вывод в stdout — NDJSON, у каждой строки поле `type`. С `--sample` после каждого отправленного mouseDragged утилита читает рамки всех окон этого bundleId и печатает `{"type":"sample","t_ms":<мс от mouseDown>,"frames":[…]}`, где элементы `frames` в той же схеме, что в `list` (pid, title, frame). Сразу после `CGEventPost` mouseUp печатается `{"type":"mouseUp","t_ms":…}`. Последней строкой всегда (и без `--sample`) идёт `{"type":"summary","steps":<n>,"duration_ms":<мс от mouseDown до mouseUp>}`. После mouseUp сэмплы не печатаются.
+- `cursor-at x y`: переносит курсор в глобальную точку (`CGWarpMouseCursorPosition`, затем событие mouseMoved), через 200 ms и через 1 s печатает JSON с `hotSpot` и размером `image` у `NSCursor.currentSystem` и признаком совпадения с `NSCursor.resizeLeftRight`.
+- `focused`: bundleId приложения в фокусе.
+- `close --bundle <id> --index <n>`: нажимает кнопку закрытия окна (`kAXCloseButtonAttribute`, затем `kAXPressAction`).
+- `fixed-window [--title <t>]`: переводит `tgprobe` в `activationPolicy .regular`, открывает `NSWindow` 400×300 со `styleMask [.titled, .closable]` без `.resizable` и работает, пока его не завершат. Это окно с фиксированным размером.
+
+Подкоманды с AX (`list`, `set-frame`, `bench`, `drag`, `cursor-at`, `focused`, `close`) выполняются не из терминала, а внутри `TermGrid.app`: право Accessibility выдаётся только приложению, терминалу и агенту никакие права не нужны. Механизм (только под `#if DEBUG`): запуск `open build/TermGrid.app --args --probe <request.json> --probe-out <out.ndjson>`. `request.json` — массив команд `{"cmd":"list","bundle":"com.apple.Terminal"}` с теми же параметрами, что у подкоманд выше. Приложение выполняет их по порядку, пишет по строке NDJSON на команду в `out.ndjson` (поле `type`, как у `drag`) и завершается. Код AX-подкоманд лежит в общей библиотеке `ProbeKit`, которую используют `TermGrid` и `tgprobe`. Консольный `tgprobe` оставлен для проверок, не требующих AX (usage, `TGPROBE_FORCE_UNTRUSTED`, коды ошибок). Агент не запускает `open` сам (в песочнице он блокируется): он готовит `request.json` и выдаёт пользователю точную команду запуска, затем читает `out.ndjson`.
+
+При старте утилита ставит `AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), 0.5)`, чтобы `tgprobe list` не зависал на остановленном приложении. Если переменная окружения `TGPROBE_FORCE_UNTRUSTED=1`, проверка доступа считается вернувшей false; дальше та же ветка, что при `AXIsProcessTrusted() == false`.
+
+### Evidence
+Evidence сохраняется в `.omc/evidence/step-<N>-<slug>.txt`: вывод команд, JSON из `tgprobe` и выдержки из `log show`.
+
+---
+
+## Волны выполнения
+
+```
+Wave 1:  Шаг 0  скелет пакета, скрипты, Info.plist, .gitignore
+Wave 2:  Шаг 1  tgprobe + spike (TCC, bench, non-activating drag)   ┐
+         Шаг 2  GridCore: дерево, операции, пресеты, FrameSolver    ├ параллельно
+         Шаг 3  GridCore: Dividers, ScreenSpace, FitPolicy, EchoFilter ┘
+Wave 3:  Шаг 4  AXWindow + WindowDiscovery + WindowMover (после 1)  ┐ параллельно
+         Шаг 5  TermGridApp + Permissions + MenuContent каркас      ┘
+Wave 4:  Шаг 6  GridController: назначение, apply, FitPolicy (после 2,3,4,5)
+Wave 5:  Шаг 7  DividerPanel/Overlay + live drag (после 6)
+         Шаг 8  AXEventMonitor + реакции (после 6; ветка, затем rebase на 7. Оба шага правят GridController, поэтому сливаются последовательно)
+Wave 6:  Шаг 9  персистенция (после 7,8)                            ┐ параллельно
+         Шаг 10 README + итоговая проверка (после 7,8)              ┘
+Final:   F1-F4 ревью
+```
+
+Профиль исполнителя: `executor` на `sonnet`. Шаги 4, 7 и 8 содержат новую конкурентную логику (очередь AX, коалесценция, фильтр эха), поэтому по правилу E4 они идут на `opus` с префиксом `[opus:E4]`. Шаги 0 и 10 простые и помечены `[mech]`.
+
+---
+
+## Шаги реализации
+
+Критерии приёмки внутри каждого шага нумеруются с 0. Каждый критерий подтверждается evidence, на которое можно сослаться (команда и результат или `file:line`).
+
+### Шаг 0. Скелет пакета и скрипты `[mech]`
+
+**Что сделать**
+- `Package.swift`: `// swift-tools-version:6.0`, `platforms: [.macOS(.v14)]`. Targets: `GridCore` (library), `TermGrid` (executable, зависит от GridCore, `swiftSettings: [.swiftLanguageMode(.v5)]`), `tgprobe` (executable, Swift 5 mode), `GridCoreTests` (testTarget).
+- Минимальные заглушки: пустой `@main` в `TermGrid` с `NSApplication` и `MenuBarExtra` с одним пунктом "Выход", `tgprobe` печатает usage, в `GridCore` один тип `CellID` и `Tests/GridCoreTests/CellIDTests.swift` с `import Testing`, `@testable import GridCore` и одним `@Test` на `CellID`.
+- `Resources/Info.plist`: `CFBundleIdentifier=local.termgrid.TermGrid`, `CFBundleName=TermGrid`, `CFBundleExecutable=TermGrid`, `CFBundlePackageType=APPL`, `LSUIElement=true`, `LSMinimumSystemVersion=14.0`, `CFBundleShortVersionString=0.1.0`, `CFBundleVersion=1`. Файл не включается в ресурсы SwiftPM, его копирует скрипт.
+- `scripts/build-app.sh`, `scripts/test.sh` (флаги CLT из раздела "Исследование", аргументы пробрасываются в `swift test`), `scripts/check-no-comments.sh`. Последний ищет `//` и `/*` в начале строки или после кода в `Sources Tests`, кроме строки `swift-tools-version`, и `#` в `scripts/*.sh`, кроме shebang. Если находки есть, код выхода 1.
+- `.gitignore`: `.build/`, `build/`, `.omc/`, `.swiftpm/`.
+
+**Не делать**: не создавать Xcode-проект, не добавлять зависимости из сети.
+
+**Критерии приёмки**
+- 0. `swift build` (вне песочницы) завершается с кодом 0.
+- 1. `scripts/build-app.sh debug` создаёт `build/TermGrid.app`. `plutil -lint build/TermGrid.app/Contents/Info.plist` выдаёт OK, `plutil -extract LSUIElement raw build/TermGrid.app/Contents/Info.plist` выдаёт `true`.
+- 2. `codesign --verify --strict build/TermGrid.app` завершается с кодом 0.
+- 3. `scripts/check-no-comments.sh` завершается с кодом 0. Если временно добавить файл с `// x`, код выхода 1 (негативная проверка, файл затем удалить).
+- 4. `open build/TermGrid.app`, затем `pgrep -x TermGrid` возвращает PID, затем `pkill -x TermGrid`.
+- 5. `scripts/test.sh --filter CellIDTests` проходит, 1 тест.
+
+**QA**
+- Happy: критерии 0-5, вывод в `.omc/evidence/step-0-build.txt`.
+- Failure: `scripts/test.sh --filter NoSuchSuite`: вывод содержит `No matching test cases were run` и не содержит `no such module 'Testing'` и `Library not loaded`; фактический код выхода записывается в evidence как факт, без требования 0. Без флагов `swift test --filter CellIDTests` падает с `no such module 'Testing'`, что подтверждает необходимость скрипта. Вывод в `.omc/evidence/step-0-test-flags.txt`.
+
+**Коммит**: `chore(build): swiftpm skeleton, app bundle and test scripts`
+
+### Шаг 1. tgprobe и spike рисков
+
+**Что сделать**
+- Реализовать подкоманды `tgprobe` из раздела "tgprobe". Свою AX-обёртку утилита пока держит внутри себя. В шаге 4 общий код не выносится, дублирование допустимо: это отладочный инструмент.
+- Провести spike и записать результаты в `docs/spike-results.md` (таблицы и выводы, без кода):
+  - a) TCC: собрать с ad-hoc подписью, выдать Accessibility приложению TermGrid, пересобрать и проверить `AXIsProcessTrusted()` (TermGrid логирует его при старте). Повторить с self-signed сертификатом, если пользователь его создал. Вывод: какой способ подписи принят.
+  - b) `tgprobe bench` для `com.apple.Terminal`, `com.googlecode.iterm2` и одного браузера: p50, p95, max латентности одной записи и время пары size+position. Дополнительно снять `tgprobe bench --windows <k>` для k=1, 2, 4 и 6 у Terminal и iTerm2 и записать частоту на окно `1000 / p95 круга`. Порог годности задан для k=4 (grid2x2, M-2): p95 круга не выше 66 ms (то есть не меньше 15 Hz на окно) для Terminal и iTerm2; при k=6 результат только записывается. Если порог для k=4 не достигнут, шаг 1 возвращает BLOCKED с цифрами, и пользователь выбирает: принять меньшую частоту, писать только `final` для медленного приложения или принять рывки. Вывод: `maxApplyHz = min(30, floor(1000 / P))`, где P — наибольшее из значений p95 пары size+position в мс у Terminal и iTerm2 по `tgprobe bench --bundle <id> --count 60` без `--windows` (браузер в расчёт не входит, его числа только записываются); P, оба исходных p95 и итоговое maxApplyHz записываются в `docs/spike-results.md`. Также вывод: значение таймаута T (по умолчанию 0.25 s).
+  - c) Шаг символов: `set-frame` с шириной 800, 801, ..., 810 и высотой 500, 501, ..., 520 у Terminal и iTerm2, затем `list`. Таблица "запрошено / фактически". Для каждого запроса записывать AX-position до и после и вывод, какой край сдвигается при округлении. Записать профиль и шрифт Terminal и iTerm2, при которых сняты числа, и максимальный дефицит по ширине и по высоте.
+  - d) Non-activating drag: временная панель в TermGrid (флаг запуска `--spike-panel`, удаляется в шаге 7) плюс `tgprobe drag` и `tgprobe focused` до и после. Вывод: фокус не уходит, события приходят. Курсор resize из неактивного приложения: Terminal активен, `tgprobe` переносит курсор над временной панелью (`CGWarpMouseCursorPosition`, затем событие mouseMoved; для этого подкоманда `tgprobe cursor-at x y`), через 200 ms и через 1 s сравнивает `NSCursor.currentSystem` с `NSCursor.resizeLeftRight` по `hotSpot` и размеру `image`; результат и вывод записываются в `docs/spike-results.md`. Видимость панелей по Spaces: переход на соседний Space (`CGEvent` ctrl+→ из `tgprobe`; если сочетание отключено, переключает человек), затем `CGWindowListCopyWindowInfo(.optionOnScreenOnly)` не содержит окон с `kCGWindowOwnerPID` TermGrid; после возврата содержит. Если панели оказываются на другом Space, запасной вариант: скрывать их по `activeSpaceDidChangeNotification`, сравнивая управляемые окна со свежим чтением `kAXWindowsAttribute` (не с удерживаемыми элементами). Уровень панели: на временной панели уровня `.normal` окно `tgprobe fixed-window` ставится через `tgprobe set-frame` поверх середины зазора и активируется. В `CGWindowListCopyWindowInfo(.optionOnScreenOnly)` (порядок спереди назад, поля bounds и `kCGWindowOwnerPID` доступны без Screen Recording) оно стоит раньше панели, а `tgprobe drag` из точки зазора под ним не меняет рамки окон по обе стороны зазора. Затем активируется Terminal (`open -a Terminal`): панель снова стоит раньше окна `tgprobe`, и drag в той же точке меняет рамки. Если хоть одна проверка не проходит, spike d записывает в `docs/spike-results.md` выбор `.floating`, а в риски добавляется строка: "панель-разделитель перехватывает клики в полосе зазора поверх неуправляемых окон".
+  - e) Окно с фиксированным размером: `tgprobe fixed-window`, затем `tgprobe list` показывает это окно с subrole `AXStandardWindow`, `positionSettable=true`, `sizeSettable=false`.
+
+**Критерии приёмки**
+- 0. Запрос `[{"cmd":"list","bundle":"com.apple.Terminal"}]` через `TermGrid.app --probe` при выданном приложению гранте даёт в `out.ndjson` валидный JSON (`python3 -m json.tool` выдаёт 0), в котором есть хотя бы одно окно (окна терминалов пользователя в проверках не участвуют, проверка идёт по окнам `tgprobe test-windows` с `TGTEST` в заголовке).
+- 1. Запрос `set-frame` (`--bundle com.apple.Terminal --index 0 100 100 800 500`), затем `list`: рамка тестового окна `TGTEST` в пределах ±2 pt от запрошенной (шаг символов терминалов не проверяется, решение пользователя).
+- 2. В `docs/spike-results.md` есть разделы a–e; для каждого указано, что снято, что не снято (и почему), и принятое решение. Разделы по терминалам (b по Terminal и iTerm2, c) помечены «не снято по решению пользователя».
+- 3. `TGPROBE_FORCE_UNTRUSTED=1 tgprobe list` выходит с кодом 2, stderr содержит `accessibility not trusted`, без падения.
+
+**QA**
+- Happy: критерии 0-2 сохраняются в `.omc/evidence/step-1-probe.txt`.
+- Failure: критерий 3 (запуск с `TGPROBE_FORCE_UNTRUSTED=1`), плюс `set-frame --index 99` выходит с кодом 3 и сообщением `window index out of range`. Вывод в `.omc/evidence/step-1-probe-error.txt`.
+- Если `TermGrid.app` ещё не имеет права, шаг возвращает BLOCKED с инструкцией: запустить `open build/TermGrid.app`, включить TermGrid в Системные настройки → Конфиденциальность и безопасность → Универсальный доступ. Право терминала не нужно.
+
+**Коммит**: `feat(probe): tgprobe cli and spike results`
+
+### Шаг 2. GridCore: дерево, операции, пресеты, FrameSolver
+
+**Что сделать**
+- `LayoutNode` — enum: `.leaf(CellID)` или `.container(id, axis, children: [(node, ratio)])`. Сумма долей равна 1. Тип `Codable` и `Equatable`.
+- Операции: `split(cell, axis)` делит лист пополам. `close(cell)` удаляет лист и пропорционально раздаёт его долю соседям, а контейнер с одним ребёнком схлопывается. `preset(.twoColumns | .threeColumns | .twoRows | .grid2x2 | .onePlusTwo | .grid2x3)`. `autoLayout(n)` даёт столбцы = ceil(sqrt(n)), а ряды заполняются по порядку.
+- `FrameSolver.frames(tree, in: rect, gap, minCell)` возвращает `[CellID: CGRect]`. Зазор вставляется только между детьми, внешний отступ делает вызывающий код.
+
+**Тест-кейсы (`LayoutTreeTests`, `FrameSolverTests`)**: 2×2 на 1440×900 при gap 8 даёт 4 непересекающиеся рамки, суммарная ширина ряда равна 1440 - 8. `split`, затем `close` возвращает исходное дерево. `close` последнего листа даёт пустое дерево, без краша. Round-trip JSON. `autoLayout(5)` даёт 3+2. Все рамки целочисленные (округление без накопления ошибки, сумма точная).
+
+**Критерии приёмки**
+- 0. `scripts/test.sh --filter LayoutTreeTests` проходит, тестов не меньше 6.
+- 1. `scripts/test.sh --filter FrameSolverTests` проходит, тестов не меньше 4.
+- 2. `GridCore` не импортирует AppKit и ApplicationServices: `grep -rnE "import (AppKit|ApplicationServices|SwiftUI)" Sources/GridCore` пусто.
+- 3. `scripts/check-no-comments.sh` выдаёт код 0.
+
+**QA**: happy-сценарии в тестах. Failure: `split` несуществующей ячейки возвращает исходное дерево без изменений (отдельный тест). Вывод в `.omc/evidence/step-2-tests.txt`.
+
+**Коммит**: `feat(core): split-tree layout model and frame solver`
+
+### Шаг 3. GridCore: разделители, координаты, подгонка, эхо
+
+**Что сделать**
+- `Dividers.compute(tree, frames, gap)` возвращает `[Divider]`. `moveDivider(tree, id, delta, frames, minSizes)` возвращает новое дерево. Меняются только доли двух соседних детей. Clamp такой, чтобы каждая ячейка в обоих поддеревьях была не меньше `max(minCell, minSize окна)`.
+- `ScreenSpace.toAX` и `fromAX` (формулы в "Архитектура → Координаты").
+- `FitPolicy.adjust(tree, divider, actualFrames, cellFrames, gap)` возвращает новое дерево или nil (правило из "FitPolicy"). `FitPolicy.anchoredOrigin(cell, actualSize, outerEdges)` возвращает позицию окна в ячейке.
+- `EchoFilter`: `markPending(window)`, `markCompleted(window, actual, at)`, `markTimedOut(window)` и `classify(window, current, at)` → `echo | external | recovered` (`echo`: pending, 250 ms после completion или ±2 pt от `lastActual`; иначе `recovered`, если последний исход окна `timeout`; иначе `external`; следующий `markCompleted` возвращает обычные правила).
+
+**Тест-кейсы (`DividerTests`, `ScreenSpaceTests`, `FitPolicyTests`, `EchoFilterTests`)**: drag на +100 меняет ширины двух соседей на ±100, остальные не меняются. Drag за минимум упирается в minCell. В 2×2 вертикальный разделитель верхнего ряда не влияет на нижний ряд. toAX/fromAX дают round-trip на главном экране и на экране слева с x < 0, а также сверху, с AX y < 0. Терминал с дефицитом 7 pt: разделитель смещается на 7. Дефицит 50 pt (больше 40) даёт nil. В 2×2 с дефицитами 12 и 3 pt в верхнем ряду горизонтальный разделитель сдвигается на 3. Дефицит только у окна нижнего ряда — разделитель не двигается. В onePlusTwo вертикальный разделитель сдвигается по дефициту левого окна. В twoColumns при левом окне, уже прижатом к разделителю, и дефиците по размеру 7 разделитель сдвигается на 7. `anchoredOrigin`: у ячейки внешний верхний край, дефицит 9 по высоте — нижний край окна совпадает с нижним краем ячейки; оба края по оси внутренние — origin ячейки. Для gap от 4 до 16 и пресетов grid2x2 и onePlusTwo ни один прямоугольник разделителя не пересекает рамки ячеек из `FrameSolver` (площадь пересечения 0). EchoFilterTests: уведомление при pending с любой рамкой — эхо; через 100 ms после completion — эхо; через 1 s со смещением 30 pt от `lastActual` — не эхо; через 1 s с рамкой в пределах 2 pt от `lastActual` — эхо. После `markTimedOut` уведомление со смещением 30 pt через 1 s даёт `recovered`; после последующего `markCompleted` такое же уведомление даёт `external`.
+
+**Критерии приёмки**
+- 0. `scripts/test.sh --filter DividerTests` проходит.
+- 1. `scripts/test.sh --filter ScreenSpaceTests` проходит, включая кейс с отрицательными координатами.
+- 2. `scripts/test.sh --filter FitPolicyTests` и `--filter EchoFilterTests` проходят.
+- 3. Правило без AppKit из шага 2 (критерий 2) соблюдается, `check-no-comments` выдаёт код 0.
+
+**QA**: failure-кейсы в тестах: drag с delta = NaN или бесконечностью возвращает исходное дерево, и неизвестный divider id тоже. Вывод в `.omc/evidence/step-3-tests.txt`.
+
+**Коммит**: `feat(core): divider math, screen space, fit policy, echo filter`
+
+### Шаг 4. AX-слой приложения `[opus:E4]`
+
+**Что сделать**
+- `AXWindow` (Sendable-обёртка `@unchecked Sendable` вокруг AXUIElement и pid): `title`, `frame` (AX), `isPositionSettable`, `isSizeSettable`, `isMinimized`, `isFullScreen` (`"AXFullScreen"`), `raise()` (`kAXRaiseAction`). `AXWindow.init` ставит таймаут T на свой элемент; приложение при старте ставит system-wide T.
+- `WindowDiscovery.snapshot()` — фильтры из "Обнаружение окон".
+- `WindowMover`: по одной последовательной очереди на PID, таймаут T, size → pos → size для `final: true` и одна пара записей для `final: false`, `beginOperation(pids)`/`endOperation(pids)` для переключения EUI один раз на PID за операцию, readback, `ApplyResult`, коалесценция по окну и `maxApplyHz` на окно (из spike b). Первый `kAXErrorCannotComplete` в любом AX-вызове попытки записи окна (size, position, второй size, readback) прерывает попытку: остальные вызовы не выполняются, результат `status=timeout`; повтор на `final: true` — единственная вторая попытка. Если таймаут получило чтение EUI в `beginOperation`, EUI для этого PID в операции не трогается и в `endOperation` не восстанавливается. API: `request(window, frame, generation, final: Bool, completion)`. Completion вызывается на main ровно один раз на каждый принятый `request`; вытесненный коалесценцией запрос получает `status=superseded` без AX-вызовов (семантика `generation` — в "Перемещение окна").
+- Логи категории `apply`.
+
+**Критерии приёмки**
+- 0. `swift build` выдаёт 0, `check-no-comments` выдаёт 0.
+- 1. Скрытая отладочная команда `TermGrid --selftest-move <bundleId>` (флаг запуска только для QA; запуск `--selftest-move com.apple.Terminal` по правилу из "Сборка и запуск") двигает окно 0 этого приложения в левую половину экрана и завершается. В логе `status=ok` или `status=clamped`, а `tgprobe list` подтверждает рамку ±1 символ.
+- 2. Коалесценция: `--selftest-burst com.apple.Terminal` отправляет 200 запросов за 1 s. В логе количество фактических записей окна не больше `maxApplyHz + 2`, последняя рамка равна последнему запросу. В логе 200 строк completion для окна, из них `status=superseded` ровно 200 минус число фактических записей.
+- 3. Окно `tgprobe fixed-window` (`--selftest-move pid:<pid tgprobe>`) даёт `status=refused`, рамка окна по `tgprobe list` не изменилась по размеру, TermGrid не падает.
+- 4. `--selftest-move com.apple.Terminal --selftest-stop com.apple.Terminal`: в логе `status=timeout` не позже 3T + 0.1 s после строки `selftest stopped` (чтение EUI, попытка и один повтор), в каждой попытке не больше одной строки `ax timeout`, процесс TermGrid жив; после завершения выполнить `kill -CONT` для PID Terminal как страховку.
+- 5. `--selftest-burst com.apple.Terminal,com.googlecode.iterm2 --selftest-stop com.apple.Terminal` (окно Terminal и окно iTerm2): до строки `selftest continued` в логе окно iTerm2 получает не меньше `maxApplyHz/2` фактических записей за 1 s, окно Terminal даёт `status=timeout`, последняя рамка iTerm2 равна последнему запросу.
+
+**QA**: happy — критерии 1, 2 и 5 (`.omc/evidence/step-4-move.txt`). Failure — критерии 3 и 4 и запуск с несуществующим bundleId: в логе `no windows`, код выхода 0 (`.omc/evidence/step-4-move-error.txt`).
+
+**Коммит**: `feat(ax): window discovery and throttled window mover`
+
+### Шаг 5. Приложение, разрешение, меню-каркас
+
+**Что сделать**
+- `Permissions`: при старте `AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt: true])`, затем опрос каждую секунду, пока доступа нет. Кнопка "Открыть настройки" открывает `x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility`.
+- `MenuContent` (SwiftUI, `MenuBarExtra` со стилем `.window`). Без доступа показывается только экран онбординга. С доступом: секция "Сетка" (пикеры пресета, экрана и gap, кнопки "Разложить автоматически" и "Сбросить"), секция "Окна" (массив окон, который отдаёт заглушка `GridController`; в шаге 5 он пустой, показывается "Нет окон"; иконка и заголовок, обновляется при открытии меню), "Выход". Команды пока идут в заглушки GridController.
+
+**Критерии приёмки**
+- 0. `swift build` выдаёт 0, приложение запускается (`pgrep -x TermGrid`).
+- 1. При отсутствии гранта (`tccutil reset Accessibility local.termgrid.TermGrid` перед запуском) в логе `accessibility not trusted`, процесс жив через 5 s, без краша.
+- 2. При выданном гранте в логе `accessibility trusted`.
+- 3. `check-no-comments` выдаёт 0.
+
+**QA**: happy — критерий 2. Failure — критерий 1. Evidence в `.omc/evidence/step-5-permissions.txt`. Визуальную проверку меню оставляем пользователю (сценарий M-1), агент проверяет по логам.
+
+**Коммит**: `feat(app): menu bar shell and accessibility onboarding`
+
+### Шаг 6. GridController: назначение и применение
+
+**Что сделать**
+- Состояние: `tree`, `screenID`, `gap`, `bindings: [CellID: WindowKey]`, `actualFrames`, `cellStatus: ok | doesNotFit | detached | empty | notResponding`.
+- Команды: выбор пресета (существующие привязки сохраняются по порядку ячеек), `assign(window, cell)` (если окно уже в другой ячейке, ячейки меняются местами), `autoArrange(selectedWindows)`, `split`, `close`, `reapply`, изменение gap.
+- Apply: FrameSolver, затем ScreenSpace.toAX, затем WindowMover (final), затем обработка ApplyResult: minSize, refused, timeout. `reapply` записывает во все привязанные ячейки без сравнения с текущей рамкой. После полного apply FitPolicy срабатывает только для разделителей между окнами терминалов (по `bundleId` в списке `com.apple.Terminal`, `com.googlecode.iterm2`); внешняя граница сетки не подгоняется.
+- `GridController` получает список окон из `WindowDiscovery` при открытии меню (snapshot вне main, меню показывает последний снимок).
+- В меню у ячеек показываются статусы, у окон есть пункт "В ячейку…".
+
+**Критерии приёмки**
+- 0. Сценарий с отладочным флагом `--selftest-arrange com.apple.Terminal,com.googlecode.iterm2 --selftest-preset twoColumns` (запуск по правилу из "Сборка и запуск"; два окна; после критерия `pkill -x TermGrid`): `tgprobe list` показывает, что окна не пересекаются, зазор между ними 8 ±2 pt, вместе они занимают visibleFrame с отступом gap (допуск ±1 символ по определению из "Стратегия проверки").
+- 1. После подгонки зазор между терминалами в пределах 8 ±2 pt (лог `fit adjusted divider=<id> delta=<d>`), и |delta| не больше максимального дефицита по соответствующей оси из spike c.
+- 2. Ячейка, в которую назначено окно `tgprobe fixed-window`, получает в логе `doesNotFit`, повторных записей больше одной нет.
+- 3. `scripts/test.sh --filter FitPolicyTests` всё ещё проходит (scoped регрессия), `check-no-comments` выдаёт 0.
+- 4. В логе `windows discovered count=<N>`, N больше 0 при открытом окне Terminal.
+- 5. `--selftest-arrange com.apple.Terminal,com.googlecode.iterm2 --selftest-preset twoColumns --selftest-stop com.apple.Terminal` (запуск по правилу из "Сборка и запуск"; после критерия `pkill -x TermGrid`): между строками `selftest stopped` и `selftest continued` тело `stoppedReapply` даёт у ячейки Terminal `cell status=notResponding`, привязка сохранена, записей в ячейку iTerm2 между этими строками нет; после `selftest continued` selftest ждёт 1 s и только потом один раз вызывает `reapply`, в логе `cell status=ok`, а `tgprobe list` показывает рамку Terminal, совпадающую с ячейкой ±1 символ. Дополнительно в логе между `selftest continued` и выходом нет строки `detached`.
+
+**QA**: happy — критерии 0, 1 и 4 (`.omc/evidence/step-6-arrange.txt`). Failure — критерии 2 и 5 плюс закрытие одного из терминалов до запуска (ячейка `empty`, без краша) (`.omc/evidence/step-6-arrange-error.txt`).
+
+**Коммит**: `feat(grid): grid controller with assignment, apply and fit`
+
+### Шаг 7. Разделители и живой ресайз мышью `[opus:E4]`
+
+**Что сделать**
+- `DividerPanel` и `DividerOverlay` с параметрами из "Ресайз ячеек мышью". Временный `--spike-panel` из шага 1 удаляется.
+- Live drag: на каждый `mouseDragged` вызываются `moveDivider`, затем `FrameSolver` и `WindowMover.request(final: false)` только для окон в двух соседних поддеревьях. Панели переставляются сразу, окна догоняют с частотой троттлинга. На `mouseUp` выполняются `final: true`, `FitPolicy` и сохранение (сохранение работает после шага 9).
+- Панели скрываются, если сетка пустая или если пользователь выключил сетку пунктом "Скрыть разделители".
+
+**Критерии приёмки**
+- 0. Запуск по правилу из "Сборка и запуск": `--selftest-arrange com.apple.Terminal,com.apple.Terminal --selftest-preset twoColumns`; после критерия `pkill -x TermGrid`. Два терминала в twoColumns. `tgprobe drag <x разделителя> <yMid> <x+200> <yMid> --steps 30 --duration-ms 1000`: после drag ширина левого окна выросла на 200 ±1 символ, правого уменьшилась на столько же (по `tgprobe list` до и после).
+- 1. Запуск и завершение как в критерии 0. Живой ресайз: `tgprobe drag <x разделителя> <yMid> <x+200> <yMid> --steps 30 --duration-ms 1000 --sample com.apple.Terminal`: в строках `type=sample` (до строки `type=mouseUp`) ширина левого окна принимает не меньше 5 различных значений строго между исходной и итоговой, последовательность неубывающая; ширина правого окна аналогично, невозрастающая. Для каждого из двух окон `apply final=false` в логе не меньше 5 и не больше `ceil(maxApplyHz × duration_ms/1000) + 2`, где `duration_ms` берётся из строки `type=summary` вывода `tgprobe drag`; затем для каждого из двух окон ровно одна запись `final=true reason=drag` и не больше одной записи `final=true reason=fit`, после строки `fit adjusted` или `fit skipped` этого разделителя (повтор при `status=timeout` не считается).
+- 2. Запуск и завершение как в критерии 0. Drag на 2000 pt (`--steps 30 --duration-ms 1000`) упирается в minCell: правое окно не уже 120 pt.
+- 3. Запуск и завершение как в критерии 0. Фокус: `tgprobe focused` до и после drag (`--steps 30 --duration-ms 1000`) возвращает один и тот же bundleId (не `local.termgrid.TermGrid`).
+- 4. Запуск по правилу из "Сборка и запуск": `--selftest-arrange com.apple.Terminal,com.apple.Terminal,com.googlecode.iterm2,com.googlecode.iterm2 --selftest-preset grid2x2`; после критерия `pkill -x TermGrid`. В 2×2 drag (`--steps 30 --duration-ms 1000`) вертикального разделителя верхнего ряда не меняет рамки нижнего ряда.
+- 5. `check-no-comments` выдаёт 0.
+- 6. Подгонка после mouseUp: для разделителя между терминалами в логе `fit adjusted divider=<id> delta=<d>` |d| не больше `charW` или `charH` по оси drag из spike c; для разделителя, у которого хотя бы одно окно не из списка терминалов, строк `fit adjusted` нет.
+
+- 7. Высота ячейки: запуск по правилу из "Сборка и запуск": `--selftest-arrange com.apple.Terminal,com.apple.Terminal --selftest-preset twoRows`; после критерия `pkill -x TermGrid`. Затем `tgprobe drag <xMid> <y разделителя> <xMid> <y+150> --steps 30 --duration-ms 1000 --sample com.apple.Terminal` (координаты AX). По `tgprobe list` до и после высота верхнего окна выросла на 150 ±charH, нижнего уменьшилась на 150 ±charH; в строках `type=sample` высота верхнего окна принимает не меньше 5 различных значений строго между исходной и итоговой, последовательность неубывающая, у нижнего — невозрастающая.
+
+**QA**: happy — критерии 0, 1, 4 и 7 (`.omc/evidence/step-7-drag.txt`). Failure — критерии 2 и 3, плюс drag по месту без разделителя не меняет ни одной рамки; если по spike d выбран `.normal`, `tgprobe drag` из точки разделителя, накрытой неуправляемым окном Terminal (рамка через `tgprobe set-frame`), не меняет рамки управляемых окон (`tgprobe list` до и после) (`.omc/evidence/step-7-drag-error.txt`).
+
+**Коммит**: `feat(grid): draggable divider panels with live resize`
+
+### Шаг 8. Внешние события и защита от эха `[opus:E4]`
+
+**Что сделать**
+- `AXEventMonitor`: один `AXObserver` на PID с управляемыми окнами, источник в main run loop. На элемент приложения (`AXUIElementCreateApplication(pid)`) регистрируются `kAXWindowMovedNotification` и `kAXWindowResizedNotification`; колбэк получает элемент окна, его сопоставляют с привязкой через `CFEqual`, непривязанные окна игнорируются. При назначении окна в ячейку на сам элемент окна регистрируются `kAXUIElementDestroyedNotification` и `kAXWindowMiniaturizedNotification` с refcon `UnsafeMutableRawPointer(bitPattern: bindingID)`, где `bindingID` — монотонный счётчик `GridController`, начиная с 1 и без повторного использования (атрибуты уничтоженного окна не читаются). Колбэк восстанавливает его через `Int(bitPattern: refcon)` и передаёт в `GridController`, который ищет его в словаре `[Int: WindowKey]` текущих привязок; неизвестный id игнорируется. При освобождении ячейки запись удаляется из словаря вместе с `AXObserverRemoveNotification` для этих двух, даже если Remove вернул ошибку. `AXObserverAddNotification` и `AXObserverRemoveNotification` выполняются в очереди PID. Так устроен yabai (`application.c` `application_observe`, `window.c` `window_observe`).
+- Связка с `EchoFilter`: `GridController` вызывает `markPending(window)` при `request` на main, `markCompleted(window, actual, at)` в completion, `markTimedOut(window)`, если completion вернул `status=timeout`, и `classify(window, current, at)` при уведомлении. На `recovered` окно не откладывается: GridController ставит для него `request(final: true)` на рамку его ячейки, при `status=ok` ячейка получает `cell status=ok`. Ручное перемещение больше 20 pt откладывает окно (detached), destroyed и miniaturized освобождают ячейку, terminate освобождает PID, смена экранов запускает пересчёт.
+- Пункт меню "Вернуть в сетку" у откреплённых окон.
+
+**Критерии приёмки**
+- 0. Запуск по правилу из "Сборка и запуск": `--selftest-arrange com.apple.Terminal,com.apple.Terminal --selftest-preset twoColumns`; после критерия `pkill -x TermGrid`. Во время drag из шага 7 (критерий 0, `--steps 30 --duration-ms 1000`) в логе нет ни одной записи `detached`. Это доказывает, что эхо подавлено.
+- 1. `tgprobe set-frame` смещает управляемое окно на 100 pt: в логе `detached cell=<id>`, остальные окна не двигались (`tgprobe list` до и после).
+- 2. Закрытие управляемого окна Terminal (`tgprobe close --bundle com.apple.Terminal --index 0`) даёт в логе `cell empty reason=destroyed`, приложение живо.
+- 3. `pkill -x Terminal` при управляемом окне даёт `app terminated pid=` и освобождение ячеек, без краша.
+- 4. `scripts/test.sh --filter EchoFilterTests` проходит, `check-no-comments` выдаёт 0.
+- 5. TermGrid при флаге `--selftest-heartbeat` каждые 50 ms ставит задачу на main и пишет `main stall ms=<n>`, если она выполнена позже чем через 100 ms. Запуск по правилу из "Сборка и запуск": `--selftest-heartbeat --selftest-arrange com.apple.Terminal,com.googlecode.iterm2,com.googlecode.iterm2 --selftest-preset threeColumns --selftest-stop com.apple.Terminal --selftest-discover`; после критерия `pkill -x TermGrid`. Тело selftest — `stoppedReapply` и обновление снимка (см. «Сборка и запуск»), удержание не меньше 5 s, поэтому drag на 1000 ms успевает закончиться до `selftest continued`; строка `windows discovered count=` появляется до `selftest continued`. Проверяющий снимает `tgprobe list --bundle com.googlecode.iterm2` до запуска и после `selftest continued`; ждёт строку `selftest stopped` (`log stream` с предикатом subsystem `local.termgrid`) и сразу запускает `tgprobe drag <x разделителя между окнами iTerm2> <yMid> <x+200> <yMid> --steps 30 --duration-ms 1000`, который завершается до `selftest continued` (по меткам времени лога и `duration_ms`). Ширина левого окна iTerm2 выросла на 200 ±charW, правого уменьшилась на 200 ±charW (charW iTerm2 из spike c), окно Terminal не изменилось; между `selftest stopped` и `selftest continued` нет ни одной строки `main stall`.
+- 6. `tgprobe set-frame` меняет только ширину управляемого окна на +100 pt: в логе `detached cell=<id> reason=resized`, остальные окна не двигались (`tgprobe list` до и после).
+- 7. `grep -n 'AXObserverAddNotification\|AXObserverRemoveNotification' Sources/TermGrid`: каждый вызов находится внутри замыкания, отправленного в очередь PID (evidence `file:line`).
+
+**QA**: happy — критерии 0, 1 и 7 (`.omc/evidence/step-8-events.txt`). Failure — критерии 2, 3, 5 и 6 (`.omc/evidence/step-8-events-error.txt`).
+
+**Коммит**: `feat(grid): ax event monitor with echo suppression`
+
+### Шаг 9. Сохранение и восстановление раскладки (отрезаемый)
+
+**Что сделать**
+- `LayoutSnapshot` (GridCore): дерево, gap, идентификатор экрана (`NSScreen.localizedName` и размер как подсказка), привязки как список `{cellID, bundleId, title}`. Хранится в `~/Library/Application Support/TermGrid/layout.json`, атомарная запись. Сохранение после mouseUp, после команд меню и при выходе.
+- При старте дерево восстанавливается. Окна привязываются по кнопке "Восстановить окна": сначала точное совпадение bundleId и title, затем оставшиеся окна того же bundleId по порядку. Без автоматического apply при старте.
+- Повреждённый JSON переименовывается в `layout.json.bad`, приложение стартует с пустой сеткой.
+
+**Критерии приёмки**
+- 0. `scripts/test.sh --filter LayoutSnapshotTests` проходит: round-trip и декодирование повреждённого JSON дают ошибку, а не краш.
+- 1. Раскладка из двух окон, drag, выход, повторный запуск: `layout.json` содержит доли после drag. После "Восстановить окна" (флаг `--selftest-restore`, запуск по правилу из "Сборка и запуск") рамки совпадают с рамками до выхода ±1 символ.
+- 2. Записать мусор в `layout.json` и запустить приложение: появляется `layout.json.bad`, в логе `layout reset reason=corrupt`, процесс жив.
+- 3. `check-no-comments` выдаёт 0.
+
+**QA**: happy — критерий 1 (`.omc/evidence/step-9-restore.txt`). Failure — критерий 2 (`.omc/evidence/step-9-restore-error.txt`).
+
+**Коммит**: `feat(grid): persist and restore layout`
+
+### Шаг 10. README и итоговая проверка `[mech]`
+
+**Что сделать**
+- `README.md` на русском: что это, требования (macOS 14+, CLT), сборка (`scripts/build-app.sh`), тесты (`scripts/test.sh --filter …`, почему нужны флаги), запуск через `open`, выдача Accessibility, подпись (self-signed сертификат или ad-hoc со сбросом через `tccutil`), советы для терминалов (iTerm2 → Settings → Advanced → "Terminal windows resize smoothly" снимает шаг символов, название настройки сверить в текущей версии iTerm2), ограничения (Spaces, fullscreen, один экран; размер ячейки меняется разделителем, ресайз окна за край открепляет его).
+- Пройти ручные сценарии M-1…M-6 из раздела ниже, сохранить вывод `tgprobe` и логов.
+
+**Критерии приёмки**
+- 0. `scripts/build-app.sh release` выдаёт 0, `codesign --verify --strict` выдаёт 0, `strings build/TermGrid.app/Contents/MacOS/TermGrid | grep -c selftest` выдаёт 0.
+- 1. Запуск через `open`, `pgrep -x TermGrid`, `log show` без fault или error за минуту.
+- 2. В README есть разделы "Сборка", "Разрешения", "Подпись", "Ограничения" (`grep -c '^## ' README.md` не меньше 5).
+- 3. Scoped-тесты всех шагов проходят по отдельности (каждый `--filter`) с выводом. Полный `swift test` без фильтра не запускается.
+
+**Коммит**: `docs: readme with build, permissions and limits`
+
+---
+
+## Ручные сценарии (для пользователя и как дополнение к агентским)
+
+- **M-1. Онбординг**: первый запуск, система спрашивает Accessibility, пользователь выдаёт право, меню показывает список окон.
+- **M-2. 2×2 из четырёх окон** (Terminal, iTerm2, Safari, Finder): "Разложить автоматически", окна встают без пересечений с зазором 8 pt.
+- **M-3. Живой ресайз**: курсор над вертикальным разделителем меняется на ↔; при запасном пути из spike d разделитель подсвечивается при наведении. При drag оба соседних окна меняют ширину во время движения, без заметного рывка в конце. Рывок после отпускания у терминалов не больше одного символа; у окон, которые не терминалы, разделитель после отпускания не двигается. Горизонтальный разделитель с курсором ↕ ведёт себя так же.
+- **M-4. Терминалы**: после отпускания разделителя между двумя терминалами зазор ровный, без "дыры" у терминала.
+- **M-5. Внешние действия**: пользователь двигает окно сам, оно открепляется и возвращается через меню. Пользователь тянет внешний край окна у границы экрана: окно откреплено, "Вернуть в сетку" возвращает его в размер ячейки. Закрытое окно оставляет пустую ячейку.
+- **M-6. Spaces и экраны**: переключение на другой Space не оставляет "висящих" разделителей поверх чужих окон. Отключение второго монитора (если он есть) переносит сетку. Дополнительно проверяется spike d: после перехода на соседний Space список `CGWindowListCopyWindowInfo(.optionOnScreenOnly)` не содержит окон TermGrid, после возврата содержит.
+
+---
+
+## Финальная проверка
+
+> Ревьюеры работают параллельно и не доверяют отчётам исполнителя: перепроверяют сами, только scoped-тесты.
+
+- **F1. Соответствие плану** (`oracle`): каждый пункт "Обязательно в MVP" реализован, каждый из "Не-цели" отсутствует (`grep -rn "ScreenCaptureKit\|SCStream\|CGRequestScreenCaptureAccess\|RegisterEventHotKey\|_AXUIElementGetWindow" Sources` пусто). Evidence-файлы всех шагов существуют. Шаг 9 проверяется, только если он не отрезан.
+- **F2. Качество кода** (`code-reviewer`): `swift build -c release` выдаёт 0, `check-no-comments` выдаёт 0, `strings build/TermGrid.app/Contents/MacOS/TermGrid | grep -c selftest` после `scripts/build-app.sh release` выдаёт 0, scoped-тесты по каждому suite. Отсутствуют force unwrap на результатах AX, пустые `catch`, `print` в приложении (вместо него `Logger`), лишние абстракции.
+- **F3. Сценарии** (`verifier`, `sonnet`): повторить QA шагов 6-9 через `tgprobe` и логи (критерии с `--selftest-*` на debug-сборке), evidence в `.omc/evidence/final-qa/`.
+- **F4. Границы scope** (`critic`): ничего сверх плана (хоткеи, мультимонитор, drag-swap, превью) и ничего из плана не пропущено.
+
+## Стратегия коммитов
+Один коммит на шаг, сообщения указаны в шагах. Без `Co-Authored-By` и без "Generated with Claude Code". Перед коммитом обязательны `scripts/check-no-comments.sh` и scoped-тесты шага. Работа ведётся в ветке `feat/window-grid`, а не в `main`.
+
+## Критерии успеха
+```bash
+scripts/build-app.sh release                      # exit 0
+codesign --verify --strict build/TermGrid.app     # exit 0
+scripts/check-no-comments.sh                      # exit 0
+scripts/test.sh --filter DividerTests             # passed (и аналогично по каждому suite отдельно)
+open build/TermGrid.app && sleep 3 && pgrep -x TermGrid   # PID
+```
+- [ ] Окна любых приложений раскладываются по сетке.
+- [ ] Ширина и высота ячеек меняются мышью, окна следуют за ней во время drag.
+- [ ] Используется только разрешение Accessibility.
+- [ ] Все evidence-файлы на месте, F1-F4 одобрены.
