@@ -29,7 +29,10 @@ public enum LayoutSnapshotError: Error, Equatable {
 }
 
 public struct LayoutSnapshot: Codable, Equatable, Sendable {
-    public static let gapRange = 0...64
+    public static let gapRange = 4...16
+    public static let defaultGap = 8
+    public static let idRange = 0..<10_000
+    public static let maxCells = 64
     private static let ratioTolerance = 1e-3
 
     public var tree: LayoutNode
@@ -51,11 +54,22 @@ public struct LayoutSnapshot: Codable, Equatable, Sendable {
     }
 
     public static func decode(_ data: Data) throws -> LayoutSnapshot {
-        let snapshot = try JSONDecoder().decode(LayoutSnapshot.self, from: data)
+        var snapshot = try JSONDecoder().decode(LayoutSnapshot.self, from: data)
         guard snapshot.isValid else {
             throw LayoutSnapshotError.invalid
         }
+        if !gapRange.contains(snapshot.gap) {
+            snapshot.gap = defaultGap
+        }
         return snapshot
+    }
+
+    public static func restorable(_ pending: [SavedBinding], cells: [CellID], occupied: Set<CellID>) -> [SavedBinding] {
+        pending.filter { cells.contains($0.cellID) && !occupied.contains($0.cellID) }
+    }
+
+    public static func unmatched(_ pending: [SavedBinding], matches: [CellID: Int]) -> [SavedBinding] {
+        pending.filter { matches[$0.cellID] == nil }
     }
 
     public static func match(_ bindings: [SavedBinding], windows: [(bundleId: String?, title: String)]) -> [CellID: Int] {
@@ -85,10 +99,15 @@ public struct LayoutSnapshot: Codable, Equatable, Sendable {
     }
 
     private var isValid: Bool {
-        guard Self.gapRange.contains(gap), Self.isValid(tree) else { return false }
+        guard Self.isValid(tree) else { return false }
         let leaves = tree.leafIDs
         let containers = tree.containerIDs
-        guard Set(leaves).count == leaves.count, Set(containers).count == containers.count else { return false }
+        guard leaves.count <= Self.maxCells,
+              leaves.allSatisfy({ Self.idRange.contains($0.rawValue) }),
+              containers.allSatisfy({ Self.idRange.contains($0.rawValue) }),
+              Set(leaves).count == leaves.count,
+              Set(containers).count == containers.count
+        else { return false }
         let bound = bindings.map(\.cellID)
         return Set(bound).count == bound.count && bound.allSatisfy(leaves.contains)
     }
@@ -111,6 +130,7 @@ public enum LayoutLoadResult: Equatable, Sendable {
     case missing
     case loaded(LayoutSnapshot)
     case corrupt
+    case unreadable
 }
 
 public struct LayoutStore: Sendable {
@@ -139,8 +159,9 @@ public struct LayoutStore: Sendable {
 
     public func load() -> LayoutLoadResult {
         guard FileManager.default.fileExists(atPath: url.path) else { return .missing }
+        guard let data = try? Data(contentsOf: url) else { return .unreadable }
         do {
-            return .loaded(try LayoutSnapshot.decode(try Data(contentsOf: url)))
+            return .loaded(try LayoutSnapshot.decode(data))
         } catch {
             quarantine()
             return .corrupt

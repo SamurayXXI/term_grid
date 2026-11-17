@@ -118,4 +118,41 @@ import Testing
             #expect(next.at - previous.at >= interval - 1e-9)
         }
     }
+
+    @Test func removeGroupReturnsPendingTicketsAndForgetsLanes() {
+        var scheduler = Scheduler(maxRate: 30)
+        _ = scheduler.submit(1, for: "a", group: 1, now: 0)
+        _ = scheduler.submit(2, for: "a", group: 1, now: 0.001)
+        _ = scheduler.submit(3, for: "b", group: 1, now: 0)
+        _ = scheduler.submit(4, for: "c", group: 2, now: 0)
+        let removed = scheduler.removeGroup(1)
+        #expect(removed == [2])
+        #expect(!scheduler.isGroupActive(1))
+        #expect(scheduler.isGroupActive(2))
+        #expect(scheduler.laneCount == 1)
+        #expect(scheduler.finish("a", now: 0.1) == .idle)
+        #expect(scheduler.timerFired("a", now: 0.2) == .idle)
+        #expect(scheduler.laneCount == 1)
+    }
+
+    @Test func finishDropsIdleLanesOnceThrottleWindowPassed() {
+        var scheduler = Scheduler(maxRate: 30)
+        _ = scheduler.submit(1, for: "a", group: 1, now: 0)
+        _ = scheduler.finish("a", now: 0.001)
+        #expect(scheduler.laneCount == 1)
+        _ = scheduler.submit(2, for: "b", group: 1, now: 1)
+        _ = scheduler.finish("b", now: 1.001)
+        #expect(scheduler.laneCount == 1)
+        _ = scheduler.submit(3, for: "c", group: 1, now: 2)
+        _ = scheduler.finish("c", now: 2 + interval)
+        #expect(scheduler.laneCount == 0)
+    }
+
+    @Test func droppedLaneStartsNextRequestImmediately() {
+        var scheduler = Scheduler(maxRate: 30)
+        _ = scheduler.submit(1, for: "a", group: 1, now: 0)
+        _ = scheduler.finish("a", now: interval)
+        #expect(scheduler.laneCount == 0)
+        #expect(scheduler.submit(2, for: "a", group: 1, now: interval * 1.5).action == .start(2))
+    }
 }

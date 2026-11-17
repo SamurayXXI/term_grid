@@ -69,13 +69,83 @@ import Testing
         }
     }
 
-    @Test func gapOutOfRangeThrows() throws {
+    @Test func gapOutOfRangeLoadsAsDefault() throws {
+        for gap in [-1, 0, 3, 17, 64] {
+            var snapshot = sample()
+            snapshot.gap = gap
+            let decoded = try LayoutSnapshot.decode(snapshot.encoded())
+            #expect(decoded.gap == LayoutSnapshot.defaultGap)
+            #expect(decoded.tree == snapshot.tree)
+        }
+    }
+
+    @Test func gapInsideRangeIsKept() throws {
+        for gap in [4, 12, 16] {
+            var snapshot = sample()
+            snapshot.gap = gap
+            #expect(try LayoutSnapshot.decode(snapshot.encoded()).gap == gap)
+        }
+    }
+
+    @Test func cellIdOutsideRangeThrows() throws {
+        for raw in [-1, 10_000, Int.max] {
+            var snapshot = sample()
+            snapshot.tree = .container(ContainerID(0), .horizontal, [
+                LayoutChild(node: .leaf(CellID(0)), ratio: 0.5),
+                LayoutChild(node: .leaf(CellID(raw)), ratio: 0.5),
+            ])
+            snapshot.bindings = []
+            let data = try snapshot.encoded()
+            #expect(throws: LayoutSnapshotError.invalid) {
+                try LayoutSnapshot.decode(data)
+            }
+        }
+    }
+
+    @Test func containerIdOutsideRangeThrows() throws {
         var snapshot = sample()
-        snapshot.gap = -1
+        snapshot.tree = .container(ContainerID(Int.max), .horizontal, [
+            LayoutChild(node: .leaf(CellID(0)), ratio: 0.5),
+            LayoutChild(node: .leaf(CellID(1)), ratio: 0.5),
+        ])
         let data = try snapshot.encoded()
         #expect(throws: LayoutSnapshotError.invalid) {
             try LayoutSnapshot.decode(data)
         }
+    }
+
+    @Test func tooManyCellsThrow() throws {
+        let count = LayoutSnapshot.maxCells + 1
+        var snapshot = sample()
+        snapshot.tree = .container(ContainerID(0), .horizontal, (0..<count).map {
+            LayoutChild(node: .leaf(CellID($0)), ratio: 1 / Double(count))
+        })
+        snapshot.bindings = []
+        let data = try snapshot.encoded()
+        #expect(throws: LayoutSnapshotError.invalid) {
+            try LayoutSnapshot.decode(data)
+        }
+    }
+
+    @Test func maxIdTreeStillSplits() throws {
+        var snapshot = sample()
+        snapshot.tree = .container(ContainerID(9_999), .horizontal, [
+            LayoutChild(node: .leaf(CellID(0)), ratio: 0.5),
+            LayoutChild(node: .leaf(CellID(9_999)), ratio: 0.5),
+        ])
+        snapshot.bindings = []
+        let decoded = try LayoutSnapshot.decode(snapshot.encoded())
+        let split = LayoutOps.split(decoded.tree, cell: CellID(9_999), axis: .vertical)
+        #expect(split.leafIDs.contains(CellID(10_000)))
+    }
+
+    @Test func unreadableFileIsNotQuarantined() throws {
+        let store = temporaryStore()
+        defer { try? FileManager.default.removeItem(at: store.url.deletingLastPathComponent()) }
+        try FileManager.default.createDirectory(at: store.url, withIntermediateDirectories: true)
+        #expect(store.load() == .unreadable)
+        #expect(FileManager.default.fileExists(atPath: store.url.path))
+        #expect(!FileManager.default.fileExists(atPath: store.badURL.path))
     }
 
     @Test func storeSavesAndLoads() throws {
@@ -145,5 +215,45 @@ import Testing
         let bindings = [SavedBinding(cellID: CellID(0), bundleId: "t", title: "a")]
         let windows: [(bundleId: String?, title: String)] = [(nil, "a")]
         #expect(LayoutSnapshot.match(bindings, windows: windows).isEmpty)
+    }
+
+    @Test func restorableSkipsMissingBoundAndDetachedCells() {
+        let pending = [
+            SavedBinding(cellID: CellID(0), bundleId: "t", title: "a"),
+            SavedBinding(cellID: CellID(1), bundleId: "t", title: "b"),
+            SavedBinding(cellID: CellID(2), bundleId: "t", title: "c"),
+            SavedBinding(cellID: CellID(7), bundleId: "t", title: "gone"),
+        ]
+        let result = LayoutSnapshot.restorable(
+            pending,
+            cells: [CellID(0), CellID(1), CellID(2)],
+            occupied: [CellID(1), CellID(2)]
+        )
+        #expect(result == [pending[0]])
+    }
+
+    @Test func unmatchedKeepsOnlyHintsWithoutWindow() {
+        let pending = [
+            SavedBinding(cellID: CellID(0), bundleId: "t", title: "a"),
+            SavedBinding(cellID: CellID(1), bundleId: "u", title: "b"),
+        ]
+        let matches = LayoutSnapshot.match(pending, windows: [("t", "a")])
+        #expect(LayoutSnapshot.unmatched(pending, matches: matches) == [pending[1]])
+        #expect(LayoutSnapshot.unmatched(pending, matches: [CellID(0): 0, CellID(1): 1]).isEmpty)
+    }
+
+    @Test func restoreAfterUserAssignmentDropsTheAssignedCell() {
+        let pending = [
+            SavedBinding(cellID: CellID(0), bundleId: "t", title: "a"),
+            SavedBinding(cellID: CellID(1), bundleId: "t", title: "b"),
+        ]
+        let cells = [CellID(0), CellID(1)]
+        let atClick = LayoutSnapshot.restorable(pending, cells: cells, occupied: [])
+        let atSnapshot = LayoutSnapshot.restorable(pending, cells: cells, occupied: [CellID(0)])
+            .filter(atClick.contains)
+        #expect(atSnapshot == [pending[1]])
+        let matches = LayoutSnapshot.match(atSnapshot, windows: [("t", "a"), ("t", "b")])
+        #expect(matches == [CellID(1): 1])
+        #expect(LayoutSnapshot.unmatched(atSnapshot, matches: matches).isEmpty)
     }
 }

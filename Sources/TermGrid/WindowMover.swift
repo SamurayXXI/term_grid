@@ -45,6 +45,7 @@ final class WindowMover {
     private var lanes: [pid_t: ProcessLane] = [:]
     private var requests: [Int: Request] = [:]
     private var lastFrames: [AXWindow: CGRect] = [:]
+    private var forgotten = Set<pid_t>()
     private var nextTicket = 0
 
     init(maxApplyHz: Double = WindowMover.defaultMaxApplyHz) {
@@ -61,6 +62,7 @@ final class WindowMover {
         outerEdges: OuterEdges = [],
         completion: @escaping @MainActor (ApplyResult) -> Void
     ) {
+        forgotten.remove(window.pid)
         nextTicket += 1
         let ticket = nextTicket
         requests[ticket] = Request(
@@ -75,13 +77,17 @@ final class WindowMover {
         )
         let submission = scheduler.submit(ticket, for: window, group: window.pid, now: Self.now())
         if let superseded = submission.superseded {
-            DispatchQueue.main.async {
-                MainActor.assumeIsolated {
-                    self.deliver(superseded, outcome: ApplyOutcome(status: .superseded, attempts: 0))
-                }
-            }
+            deliverSuperseded(superseded)
         }
         perform(submission.action, for: window)
+    }
+
+    private func deliverSuperseded(_ ticket: Int) {
+        DispatchQueue.main.async {
+            MainActor.assumeIsolated {
+                self.deliver(ticket, outcome: ApplyOutcome(status: .superseded, attempts: 0))
+            }
+        }
     }
 
     func beginOperation(_ pids: Set<pid_t>) {
@@ -104,6 +110,14 @@ final class WindowMover {
     }
 
     func readFrame(_ window: AXWindow, completion: @escaping @MainActor (Result<CGRect, AccessFailure>) -> Void) {
+        guard !forgotten.contains(window.pid) else {
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    completion(.failure(.invalidElement))
+                }
+            }
+            return
+        }
         lane(for: window.pid).queue.async {
             let result = window.readFrame()
             DispatchQueue.main.async {
@@ -117,7 +131,11 @@ final class WindowMover {
     @discardableResult
     func forget(_ pid: pid_t) -> Bool {
         operations.forget(pid)
+        forgotten.insert(pid)
         lastFrames = lastFrames.filter { $0.key.pid != pid }
+        for ticket in scheduler.removeGroup(pid) {
+            deliverSuperseded(ticket)
+        }
         return lanes.removeValue(forKey: pid) != nil
     }
 
@@ -177,6 +195,10 @@ final class WindowMover {
     }
 
     private func dispatchAttempt(_ ticket: Int, for window: AXWindow) {
+        guard !forgotten.contains(window.pid) else {
+            attemptFinished(ticket, window: window, outcome: ApplyOutcome(status: .invalidElement, attempts: 0))
+            return
+        }
         guard let request = requests[ticket] else {
             attemptFinished(ticket, window: window, outcome: ApplyOutcome(status: .refused, attempts: 0))
             return

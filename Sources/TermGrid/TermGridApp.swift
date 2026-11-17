@@ -196,6 +196,22 @@ enum ProbeLauncher {
 }
 #endif
 
+enum TerminationSignal {
+    private static var source: DispatchSourceSignal?
+
+    static func install() {
+        signal(SIGTERM, SIG_IGN)
+        let source = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+        source.setEventHandler {
+            MainActor.assumeIsolated {
+                NSApplication.shared.terminate(nil)
+            }
+        }
+        source.resume()
+        self.source = source
+    }
+}
+
 @main
 struct TermGridApp: App {
     @StateObject private var permissions = Permissions()
@@ -203,6 +219,7 @@ struct TermGridApp: App {
 
     init() {
         AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), AXWindow.messagingTimeout)
+        TerminationSignal.install()
         #if DEBUG
         ProbeLauncher.start()
         SelfTestLauncher.start()

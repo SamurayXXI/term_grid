@@ -107,7 +107,7 @@ struct MenuContent: View {
             Button("Восстановить окна") {
                 controller.restoreWindows()
             }
-            .disabled(controller.pendingBindings.isEmpty)
+            .disabled(controller.pendingBindings.isEmpty || controller.isRestoring)
         }
     }
 

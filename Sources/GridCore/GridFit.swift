@@ -114,6 +114,17 @@ public enum GridFit {
         return .adjusted(tree: next, frames: nextFrames, delta: before - after)
     }
 
+    public static func retainedActuals(
+        _ actuals: [CellID: CGRect],
+        old: [CellID: CGRect],
+        new: [CellID: CGRect]
+    ) -> [CellID: CGRect] {
+        actuals.filter { cell, _ in
+            guard let before = old[cell], let after = new[cell] else { return false }
+            return before == after
+        }
+    }
+
     private static func carry(
         _ actuals: [CellID: CGRect],
         from old: [CellID: CGRect],

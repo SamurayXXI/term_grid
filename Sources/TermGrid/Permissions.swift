@@ -10,6 +10,7 @@ final class Permissions: ObservableObject {
 
     @Published private(set) var isTrusted: Bool
     private var timer: Timer?
+    private var accessibilityObserver: NSObjectProtocol?
 
     init() {
         #if DEBUG
@@ -37,19 +38,36 @@ final class Permissions: ObservableObject {
     }
 
     private func startPolling() {
-        timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
                 self?.poll()
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
+        accessibilityObserver = DistributedNotificationCenter.default().addObserver(
+            forName: NSNotification.Name("com.apple.accessibility.api"),
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                MainActor.assumeIsolated {
+                    self?.poll()
+                }
             }
         }
     }
 
     private func poll() {
-        guard AXIsProcessTrusted() else {
+        guard !isTrusted, AXIsProcessTrusted() else {
             return
         }
         timer?.invalidate()
         timer = nil
+        if let accessibilityObserver {
+            DistributedNotificationCenter.default().removeObserver(accessibilityObserver)
+            self.accessibilityObserver = nil
+        }
         isTrusted = true
         permissionsLogger.notice("accessibility trusted")
     }

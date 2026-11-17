@@ -46,14 +46,14 @@ extension CellStatus {
 
 @MainActor
 final class GridController: ObservableObject {
-    static let shared = GridController()
-    static let gapChoices: [Int] = [0, 4, 8, 12, 16]
+    static let shared = GridController(store: GridController.launchStore())
+    static let gapChoices: [Int] = [4, 8, 12, 16]
     static let terminalBundleIds: Set<String> = ["com.apple.Terminal", "com.googlecode.iterm2"]
     private static let minCell = CGSize(width: 120, height: 80)
 
     private final class Operation {
         let id: Int
-        let pids: Set<pid_t>
+        var pids: Set<pid_t>
         let runsFit: Bool
         let fitDivider: DividerID?
         var outstanding = 0
@@ -74,6 +74,7 @@ final class GridController: ObservableObject {
         let operation: Operation
         let targets: [(CellID, AXWindow)]
         var tree: LayoutNode
+        var lastPoint: CGPoint
     }
 
     let presets = LayoutPreset.allCases
@@ -95,6 +96,8 @@ final class GridController: ObservableObject {
     private(set) var shownDividers: [Divider] = []
 
     @Published private(set) var pendingBindings: [SavedBinding] = []
+    @Published private(set) var isRestoring = false
+    private var restoreGeneration = 0
 
     private let store: LayoutStore
     private let mover = WindowMover()
@@ -102,7 +105,7 @@ final class GridController: ObservableObject {
         begin: { [unowned self] id, point in self.beginDrag(id, at: point) },
         move: { [unowned self] point in self.moveDrag(to: point) },
         end: { [unowned self] point in self.endDrag(at: point) },
-        cancel: { [unowned self] in self.cancelDrag() },
+        cancel: { [unowned self] in self.dragLost() },
         managesWindows: { [unowned self] pid in self.model.bindings.values.contains { $0.pid == pid } }
     ))
     private var activeDrag: ActiveDrag?
@@ -120,6 +123,24 @@ final class GridController: ObservableObject {
     private var refreshGeneration = 0
     private var operationCounter = 0
     private var latestOperation = 0
+
+    private static func launchStore() -> LayoutStore {
+        #if DEBUG
+        let arguments = CommandLine.arguments
+        if arguments.contains(where: { $0.hasPrefix("--selftest-") }) {
+            let path = arguments.firstIndex(of: "--selftest-layout-path")
+                .flatMap { arguments.indices.contains($0 + 1) ? arguments[$0 + 1] : nil }
+                ?? ProcessInfo.processInfo.environment["TERMGRID_LAYOUT_PATH"]
+            let url = path.map { URL(fileURLWithPath: $0) }
+                ?? FileManager.default.temporaryDirectory
+                    .appendingPathComponent("termgrid-selftest")
+                    .appendingPathComponent("layout.json")
+            gridLogger.notice("layout store path=\(url.path, privacy: .public)")
+            return LayoutStore(url: url)
+        }
+        #endif
+        return .standard
+    }
 
     init(store: LayoutStore = .standard) {
         self.store = store
@@ -205,6 +226,7 @@ final class GridController: ObservableObject {
         gridLogger.notice("command setPreset \(preset.title, privacy: .public)")
         model.applyPreset(LayoutOps.preset(preset))
         pendingBindings = []
+        invalidateRestore()
         actualFrames = [:]
         saveLayout()
         apply()
@@ -231,6 +253,7 @@ final class GridController: ObservableObject {
             windowInfo[window.window] = window
         }
         pendingBindings = []
+        invalidateRestore()
         actualFrames = [:]
         saveLayout()
         apply()
@@ -242,6 +265,7 @@ final class GridController: ObservableObject {
 
     func assignAll(_ assignments: [(DiscoveredWindow, CellID)], onFinished: (() -> Void)? = nil) {
         gridLogger.notice("command assign count=\(assignments.count)")
+        invalidateRestore()
         var affected = Set<CellID>()
         for (window, cell) in assignments {
             windowInfo[window.window] = window
@@ -316,6 +340,7 @@ final class GridController: ObservableObject {
         cancelDrag()
         model.reset()
         pendingBindings = []
+        invalidateRestore()
         selected = []
         actualFrames = [:]
         saveLayout()
@@ -340,13 +365,15 @@ final class GridController: ObservableObject {
             onFinished: nil
         )
         mover.beginOperation(operation.pids)
-        activeDrag = ActiveDrag(plan: plan, operation: operation, targets: targets, tree: model.tree)
+        activeDrag = ActiveDrag(plan: plan, operation: operation, targets: targets, tree: model.tree, lastPoint: point)
         gridLogger.notice("drag begin divider=\(Self.describe(id), privacy: .public) windows=\(targets.count)")
         return true
     }
 
     func moveDrag(to point: CGPoint) {
         guard var drag = activeDrag else { return }
+        drag.lastPoint = point
+        activeDrag = drag
         let next = drag.plan.tree(to: point, minSizes: model.cellMinSizes, minCell: Self.minCell)
         guard next != drag.tree else { return }
         drag.tree = next
@@ -374,6 +401,12 @@ final class GridController: ObservableObject {
         }
     }
 
+    private func dragLost() {
+        guard let drag = activeDrag else { return }
+        gridLogger.notice("drag lost divider=\(Self.describe(drag.plan.divider.id), privacy: .public)")
+        endDrag(at: drag.lastPoint)
+    }
+
     func cancelDrag() {
         guard let drag = activeDrag else { return }
         activeDrag = nil
@@ -384,32 +417,60 @@ final class GridController: ObservableObject {
 
     func restoreWindows(accepting: (@Sendable (DiscoveredWindow) -> Bool)? = nil, onFinished: (() -> Void)? = nil) {
         gridLogger.notice("command restoreWindows pending=\(self.pendingBindings.count)")
-        let pending = pendingBindings.filter { model.cells.contains($0.cellID) && model.bindings[$0.cellID] == nil }
-        guard !pending.isEmpty else {
+        guard !isRestoring else {
             onFinished?()
             return
         }
+        let pending = restorablePending()
+        guard !pending.isEmpty else {
+            pendingBindings = []
+            saveLayout()
+            onFinished?()
+            return
+        }
+        isRestoring = true
+        let generation = restoreGeneration
         Task.detached(priority: .userInitiated) {
             let snapshot = WindowDiscovery.snapshot()
             await MainActor.run {
+                guard generation == self.restoreGeneration else {
+                    logApply("layout restore abandoned")
+                    onFinished?()
+                    return
+                }
+                self.isRestoring = false
                 self.bindRestored(pending, from: snapshot, accepting: accepting, onFinished: onFinished)
             }
         }
     }
 
+    private func restorablePending() -> [SavedBinding] {
+        let occupied = Set(model.bindings.keys).union(model.detached.keys)
+        return LayoutSnapshot.restorable(pendingBindings, cells: model.cells, occupied: occupied)
+    }
+
+    private func invalidateRestore() {
+        restoreGeneration += 1
+        isRestoring = false
+    }
+
     private func bindRestored(
-        _ pending: [SavedBinding],
+        _ captured: [SavedBinding],
         from snapshot: [DiscoveredWindow],
         accepting: (@Sendable (DiscoveredWindow) -> Bool)?,
         onFinished: (() -> Void)?
     ) {
-        let candidates = snapshot.filter { model.cell(of: $0.window) == nil && (accepting?($0) ?? true) }
+        let current = restorablePending()
+        let pending = current.filter(captured.contains)
+        let candidates = snapshot.filter {
+            model.cell(of: $0.window) == nil && model.detachedCell(of: $0.window) == nil && (accepting?($0) ?? true)
+        }
         let matches = LayoutSnapshot.match(pending, windows: candidates.map { ($0.bundleId, $0.title) })
         let assignments = model.cells.compactMap { cell in
             matches[cell].map { (candidates[$0], cell) }
         }
         logApply("layout restore matched=\(assignments.count) pending=\(pending.count)")
-        pendingBindings = []
+        pendingBindings = LayoutSnapshot.unmatched(current, matches: matches)
         guard !assignments.isEmpty else {
             saveLayout()
             onFinished?()
@@ -424,6 +485,8 @@ final class GridController: ObservableObject {
             break
         case .corrupt:
             gridLogger.notice("layout reset reason=corrupt")
+        case .unreadable:
+            gridLogger.error("layout load failed reason=unreadable")
         case .loaded(let snapshot):
             model = GridModel(tree: snapshot.tree)
             if Self.gapChoices.contains(snapshot.gap) {
@@ -503,7 +566,9 @@ final class GridController: ObservableObject {
             return
         }
         gridRect = grid
-        cellFrames = solve(model.tree, in: grid)
+        let solved = solve(model.tree, in: grid)
+        actualFrames = GridFit.retainedActuals(actualFrames, old: cellFrames, new: solved)
+        cellFrames = solved
         refreshDividers()
         let targets = boundTargets(cells: cells, pids: pids)
         guard !targets.isEmpty else {
@@ -538,6 +603,10 @@ final class GridController: ObservableObject {
         guard let frame = cellFrames[cell] else { return }
         let generation = model.nextGeneration(for: window)
         operation.outstanding += 1
+        if !operation.pids.contains(window.pid) {
+            operation.pids.insert(window.pid)
+            mover.beginOperation([window.pid])
+        }
         prepareWrite(window)
         mover.request(
             window,
@@ -569,6 +638,7 @@ final class GridController: ObservableObject {
             }
             if model.bindings[cell] == nil {
                 actualFrames[cell] = nil
+                saveLayout()
                 refreshDividers()
             }
             logApply("cell status=\(model.status(of: cell).rawValue) cell=\(cell.rawValue)")
@@ -691,6 +761,7 @@ final class GridController: ObservableObject {
         else { return }
         actualFrames[cell] = nil
         logApply("cell status=\(model.status(of: cell).rawValue) cell=\(cell.rawValue)")
+        saveLayout()
         refreshDividers()
     }
 
@@ -768,6 +839,7 @@ final class GridController: ObservableObject {
             model.markDetached(cell)
             actualFrames[cell] = nil
             logEvent("detached cell=\(cell.rawValue) reason=\(change.rawValue)")
+            saveLayout()
             refreshDividers()
         }
     }
@@ -786,6 +858,7 @@ final class GridController: ObservableObject {
         actualFrames[cell] = nil
         echo.forget(window)
         logEvent("cell empty reason=\(reason) cell=\(cell.rawValue)")
+        saveLayout()
         refreshDividers()
     }
 
@@ -804,6 +877,7 @@ final class GridController: ObservableObject {
         }
         windows.removeAll { $0.pid == pid }
         selected = selected.filter { $0.pid != pid }
+        saveLayout()
         refreshDividers()
     }
 

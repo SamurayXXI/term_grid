@@ -161,4 +161,34 @@ import Testing
         )
         #expect(plan?.adjustments.isEmpty == true)
     }
+
+    @Test func retainedActualsDropCellsWhoseFrameChangedAfterSplit() {
+        let tree = LayoutOps.preset(.twoColumns)
+        let before = solve(tree)
+        let actuals = shrunk(before, [CellID(0): CGSize(width: 7, height: 0), CellID(1): CGSize(width: 5, height: 0)])
+        let after = solve(LayoutOps.split(tree, cell: CellID(0), axis: .vertical))
+        let kept = GridFit.retainedActuals(actuals, old: before, new: after)
+        #expect(kept[CellID(0)] == nil)
+        #expect(kept[CellID(1)] == actuals[CellID(1)])
+    }
+
+    @Test func retainedActualsDropEverythingWhenGapOrScreenChanges() {
+        let tree = LayoutOps.preset(.grid2x2)
+        let before = solve(tree)
+        let actuals = shrunk(before, [CellID(0): CGSize(width: 3, height: 0), CellID(3): CGSize(width: 4, height: 0)])
+        let wider = FrameSolver.frames(tree, in: grid, gap: 16, minCell: minCell)
+        #expect(GridFit.retainedActuals(actuals, old: before, new: wider).isEmpty)
+        let moved = FrameSolver.frames(tree, in: grid.offsetBy(dx: 1512, dy: 0), gap: gap, minCell: minCell)
+        #expect(GridFit.retainedActuals(actuals, old: before, new: moved).isEmpty)
+    }
+
+    @Test func retainedActualsDropClosedCellsAndKeepUnchangedLayout() {
+        let tree = LayoutOps.preset(.threeColumns)
+        let before = solve(tree)
+        let actuals = shrunk(before, [CellID(0): CGSize(width: 2, height: 0)])
+        #expect(GridFit.retainedActuals(actuals, old: before, new: before) == actuals)
+        let closed = solve(LayoutOps.close(tree, cell: CellID(0))!)
+        #expect(GridFit.retainedActuals(actuals, old: before, new: closed).isEmpty)
+        #expect(GridFit.retainedActuals(actuals, old: [:], new: before).isEmpty)
+    }
 }

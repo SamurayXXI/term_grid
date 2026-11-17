@@ -443,12 +443,15 @@ final class SelfTestRun: @unchecked Sendable {
     }
 
     private static func resolvePid(_ target: String) -> pid_t? {
-        if target.hasPrefix("pid:") {
-            return pid_t(target.dropFirst(4))
+        let pid = target.hasPrefix("pid:")
+            ? pid_t(target.dropFirst(4))
+            : NSWorkspace.shared.runningApplications
+                .first { $0.bundleIdentifier == target && $0.activationPolicy == .regular }?
+                .processIdentifier
+        guard let pid, pid > 0, pid != getpid() else {
+            return nil
         }
-        return NSWorkspace.shared.runningApplications
-            .first { $0.bundleIdentifier == target && $0.activationPolicy == .regular }?
-            .processIdentifier
+        return pid
     }
 
     private static func burstFrame(_ base: CGRect, step: Int) -> CGRect {

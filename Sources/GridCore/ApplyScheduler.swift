@@ -42,7 +42,24 @@ public struct ApplyScheduler<Key: Hashable, Group: Hashable, Ticket> {
     public mutating func finish(_ key: Key, now: TimeInterval) -> Action {
         guard lanes[key] != nil else { return .idle }
         lanes[key]?.inFlight = false
-        return advance(key, now: now)
+        let action = advance(key, now: now)
+        dropIdleLanes(now: now)
+        return action
+    }
+
+    public mutating func removeGroup(_ group: Group) -> [Ticket] {
+        let keys = lanes.filter { $0.value.group == group }.map(\.key)
+        var pending: [Ticket] = []
+        for key in keys {
+            if let ticket = lanes.removeValue(forKey: key)?.pending {
+                pending.append(ticket)
+            }
+        }
+        return pending
+    }
+
+    var laneCount: Int {
+        lanes.count
     }
 
     public mutating func timerFired(_ key: Key, now: TimeInterval) -> Action {
@@ -53,6 +70,13 @@ public struct ApplyScheduler<Key: Hashable, Group: Hashable, Ticket> {
 
     public func isGroupActive(_ group: Group) -> Bool {
         lanes.values.contains { $0.group == group && $0.isActive }
+    }
+
+    private mutating func dropIdleLanes(now: TimeInterval) {
+        lanes = lanes.filter { _, lane in
+            lane.inFlight || lane.waiting || lane.pending != nil
+                || lane.lastStart.map { now < $0 + minInterval } ?? false
+        }
     }
 
     private mutating func advance(_ key: Key, now: TimeInterval) -> Action {

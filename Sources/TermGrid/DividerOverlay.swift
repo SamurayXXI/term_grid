@@ -37,6 +37,7 @@ final class DividerOverlay {
     func show(_ dividers: [Divider], primaryHeight: CGFloat) {
         var changed = false
         var membershipChanged = false
+        var lostDrag = false
         let wanted = Set(dividers.map(\.id))
         for (id, panel) in panels where !wanted.contains(id) {
             panel.orderOut(nil)
@@ -44,7 +45,7 @@ final class DividerOverlay {
             membershipChanged = true
             if dragging == id {
                 dragging = nil
-                handlers.cancel()
+                lostDrag = true
             }
         }
         for divider in dividers {
@@ -64,6 +65,9 @@ final class DividerOverlay {
         }
         if membershipChanged {
             overlayLogger.notice("dividers shown count=\(self.panels.count)")
+        }
+        if lostDrag {
+            handlers.cancel()
         }
     }
 
