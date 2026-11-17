@@ -120,7 +120,7 @@ enum ProbeLauncher {
         }
     }
 
-    private static func awaitTrust(timeout: TimeInterval) {
+    static func awaitTrust(timeout: TimeInterval) {
         guard ProcessInfo.processInfo.environment["TGPROBE_FORCE_UNTRUSTED"] != "1", !AXIsProcessTrusted() else {
             return
         }
@@ -179,9 +179,11 @@ enum ProbeLauncher {
 @main
 struct TermGridApp: App {
     init() {
+        AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), AXWindow.messagingTimeout)
         SpikeLauncher.start()
         #if DEBUG
         ProbeLauncher.start()
+        SelfTestLauncher.start()
         #endif
     }
 
