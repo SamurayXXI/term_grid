@@ -178,6 +178,9 @@ enum ProbeLauncher {
 
 @main
 struct TermGridApp: App {
+    @StateObject private var permissions = Permissions()
+    @StateObject private var controller = GridController()
+
     init() {
         AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), AXWindow.messagingTimeout)
         SpikeLauncher.start()
@@ -189,9 +192,8 @@ struct TermGridApp: App {
 
     var body: some Scene {
         MenuBarExtra("TermGrid", systemImage: "square.grid.2x2") {
-            Button("Выход") {
-                NSApplication.shared.terminate(nil)
-            }
+            MenuContent(permissions: permissions, controller: controller)
         }
+        .menuBarExtraStyle(.window)
     }
 }
