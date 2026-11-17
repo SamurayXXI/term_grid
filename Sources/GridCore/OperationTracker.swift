@@ -33,6 +33,10 @@ public struct OperationTracker<Group: Hashable> {
         return true
     }
 
+    public mutating func forget(_ group: Group) {
+        states[group] = nil
+    }
+
     public mutating func becameIdle(_ group: Group) -> Bool {
         guard states[group]?.awaitingIdle == true else { return false }
         states[group] = nil

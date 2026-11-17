@@ -12,7 +12,7 @@ public struct EchoFilter<Window: Hashable & Sendable>: Sendable {
     public static var tolerance: CGFloat { 2 }
 
     private struct State: Sendable {
-        var pending = false
+        var writes = 0
         var timedOut = false
         var lastActual: CGRect?
         var completedAt: TimeInterval?
@@ -23,23 +23,38 @@ public struct EchoFilter<Window: Hashable & Sendable>: Sendable {
     public init() {}
 
     public mutating func markPending(_ window: Window) {
-        states[window, default: State()].pending = true
+        states[window, default: State()].writes += 1
     }
 
     public mutating func markCompleted(_ window: Window, actual: CGRect, at time: TimeInterval) {
-        states[window] = State(pending: false, timedOut: false, lastActual: actual, completedAt: time)
+        let writes = max(0, (states[window]?.writes ?? 0) - 1)
+        states[window] = State(writes: writes, timedOut: false, lastActual: actual, completedAt: time)
     }
 
     public mutating func markTimedOut(_ window: Window) {
         var state = states[window, default: State()]
-        state.pending = false
+        state.writes = max(0, state.writes - 1)
         state.timedOut = true
         states[window] = state
     }
 
+    public mutating func markSettled(_ window: Window) {
+        guard var state = states[window] else { return }
+        state.writes = max(0, state.writes - 1)
+        states[window] = state
+    }
+
+    public mutating func forget(_ window: Window) {
+        states[window] = nil
+    }
+
+    public func isPending(_ window: Window) -> Bool {
+        (states[window]?.writes ?? 0) > 0
+    }
+
     public func classify(_ window: Window, current: CGRect, at time: TimeInterval) -> EchoClassification {
         guard let state = states[window] else { return .external }
-        if state.pending { return .echo }
+        if state.writes > 0 { return .echo }
         if let completedAt = state.completedAt, time - completedAt < Self.settleInterval { return .echo }
         if let last = state.lastActual, Self.matches(last, current) { return .echo }
         return state.timedOut ? .recovered : .external

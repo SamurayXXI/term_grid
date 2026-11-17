@@ -49,4 +49,50 @@ import Testing
         let filter = EchoFilter<Int>()
         #expect(filter.classify(window, current: actual, at: 0) == .external)
     }
+
+    @Test func pendingLastsUntilEveryWriteHasCompleted() {
+        var filter = EchoFilter<Int>()
+        filter.markPending(window)
+        filter.markPending(window)
+        filter.markCompleted(window, actual: actual, at: 10)
+        #expect(filter.isPending(window))
+        #expect(filter.classify(window, current: shifted(500), at: 20) == .echo)
+        filter.markCompleted(window, actual: actual, at: 11)
+        #expect(!filter.isPending(window))
+        #expect(filter.classify(window, current: shifted(500), at: 20) == .external)
+    }
+
+    @Test func settledWriteEndsPendingWithoutChangingLastActual() {
+        var filter = EchoFilter<Int>()
+        filter.markCompleted(window, actual: actual, at: 10)
+        filter.markPending(window)
+        filter.markSettled(window)
+        #expect(!filter.isPending(window))
+        #expect(filter.classify(window, current: shifted(1), at: 20) == .echo)
+        #expect(filter.classify(window, current: shifted(30), at: 20) == .external)
+    }
+
+    @Test func timeoutWithAnotherWriteInFlightStaysPendingThenRecovers() {
+        var filter = EchoFilter<Int>()
+        filter.markPending(window)
+        filter.markPending(window)
+        filter.markTimedOut(window)
+        #expect(filter.isPending(window))
+        filter.markSettled(window)
+        #expect(filter.classify(window, current: shifted(30), at: 20) == .recovered)
+    }
+
+    @Test func forgetDropsState() {
+        var filter = EchoFilter<Int>()
+        filter.markPending(window)
+        filter.forget(window)
+        #expect(!filter.isPending(window))
+        #expect(filter.classify(window, current: actual, at: 0) == .external)
+    }
+
+    @Test func settledOnUnknownWindowIsNoOp() {
+        var filter = EchoFilter<Int>()
+        filter.markSettled(window)
+        #expect(!filter.isPending(window))
+    }
 }

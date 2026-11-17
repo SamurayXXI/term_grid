@@ -138,6 +138,11 @@ struct MenuContent: View {
                 Button("Закрыть ячейку") {
                     controller.close(cell)
                 }
+                if status == .detached, controller.model.detached[cell] != nil {
+                    Button("Вернуть в сетку") {
+                        controller.reattach(cell)
+                    }
+                }
                 if status == .notResponding || status == .doesNotFit {
                     Button("Повторить") {
                         controller.retry(cell)
@@ -171,6 +176,7 @@ struct MenuContent: View {
 
     private func windowRow(_ window: DiscoveredWindow) -> some View {
         let cell = controller.cell(of: window)
+        let detachedCell = controller.detachedCell(of: window)
         return HStack(spacing: 6) {
             Button {
                 controller.toggleSelection(window)
@@ -187,12 +193,20 @@ struct MenuContent: View {
             if let cell {
                 Text(controller.model.status(of: cell).title)
                     .foregroundStyle(.secondary)
+            } else if detachedCell != nil {
+                Text(CellStatus.detached.title)
+                    .foregroundStyle(Color.orange)
             }
             if !window.isSizeSettable {
                 Image(systemName: "exclamationmark.triangle")
                     .help("Фиксированный размер")
             }
             Menu("В ячейку…") {
+                if let detachedCell {
+                    Button("Вернуть в сетку") {
+                        controller.reattach(detachedCell)
+                    }
+                }
                 ForEach(Array(controller.model.cells.enumerated()), id: \.element) { index, target in
                     Button("Ячейка \(index + 1)") {
                         controller.assign(window, to: target)

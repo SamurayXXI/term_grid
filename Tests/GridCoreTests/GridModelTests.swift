@@ -207,4 +207,78 @@ import Testing
         #expect(grid.bindings.isEmpty)
         #expect(grid.cells.count == 2)
     }
+
+    @Test func detachedWindowIsRememberedAndReattached() {
+        var grid = model()
+        grid.assign("a", to: CellID(0))
+        grid.markDetached(CellID(0))
+        #expect(grid.detached == [CellID(0): "a"])
+        #expect(grid.detachedCell(of: "a") == CellID(0))
+        let reattached = grid.reattach(CellID(0))
+        #expect(reattached == "a")
+        #expect(grid.bindings == [CellID(0): "a"])
+        #expect(grid.status(of: CellID(0)) == .ok)
+        #expect(grid.detached.isEmpty)
+    }
+
+    @Test func reattachWhenWindowBoundElsewhereOnlyClearsDetached() {
+        var grid = model()
+        grid.assign("a", to: CellID(0))
+        grid.markDetached(CellID(0))
+        grid.assign("b", to: CellID(1))
+        grid.markDetached(CellID(1))
+        grid.assign("a", to: CellID(1))
+        #expect(grid.detached.isEmpty)
+        #expect(grid.status(of: CellID(0)) == .empty)
+        let reattached = grid.reattach(CellID(0))
+        #expect(reattached == nil)
+        #expect(grid.bindings == [CellID(1): "a"])
+    }
+
+    @Test func assigningIntoDetachedCellDropsDetachedWindow() {
+        var grid = model()
+        grid.assign("a", to: CellID(0))
+        grid.markDetached(CellID(0))
+        grid.assign("b", to: CellID(0))
+        #expect(grid.detached.isEmpty)
+        #expect(grid.bindings == [CellID(0): "b"])
+    }
+
+    @Test func markDetachedOnEmptyCellRemembersNothing() {
+        var grid = model()
+        grid.markDetached(CellID(0))
+        #expect(grid.detached.isEmpty)
+        let reattached = grid.reattach(CellID(0))
+        #expect(reattached == nil)
+    }
+
+    @Test func unbindPresetResetAndCloseClearDetached() {
+        var grid = model(.threeColumns)
+        for (index, name) in ["a", "b", "c"].enumerated() {
+            grid.assign(name, to: CellID(index))
+            grid.markDetached(CellID(index))
+        }
+        grid.unbind(CellID(0))
+        grid.close(CellID(1))
+        #expect(grid.detached == [CellID(2): "c"])
+        grid.reset()
+        #expect(grid.detached.isEmpty)
+        grid.assign("d", to: CellID(0))
+        grid.markDetached(CellID(0))
+        grid.applyPreset(LayoutOps.preset(.twoColumns))
+        #expect(grid.detached.isEmpty)
+    }
+
+    @Test func releaseAllUnbindsMatchingBoundAndDetachedCells() {
+        var grid = model(.threeColumns)
+        grid.assign("x1", to: CellID(0))
+        grid.assign("y1", to: CellID(1))
+        grid.assign("x2", to: CellID(2))
+        grid.markDetached(CellID(2))
+        let released = grid.releaseAll { $0.hasPrefix("x") }
+        #expect(released == [CellID(0), CellID(2)])
+        #expect(grid.bindings == [CellID(1): "y1"])
+        #expect(grid.detached.isEmpty)
+        #expect(grid.status(of: CellID(2)) == .empty)
+    }
 }

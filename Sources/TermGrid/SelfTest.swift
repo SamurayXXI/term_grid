@@ -13,6 +13,11 @@ struct SelfTestOptions {
     var presetName: String
     var stop: String?
     var discover: Bool
+    var heartbeat: Bool
+
+    var runsBody: Bool {
+        move != nil || !burst.isEmpty || !arrange.isEmpty || stop != nil || discover
+    }
 
     init?(arguments: [String]) {
         func value(_ flag: String) -> String? {
@@ -33,7 +38,8 @@ struct SelfTestOptions {
         presetName = value("--selftest-preset") ?? "twoColumns"
         stop = value("--selftest-stop")
         discover = arguments.contains("--selftest-discover")
-        guard move != nil || !burst.isEmpty || !arrange.isEmpty || stop != nil || discover else {
+        heartbeat = arguments.contains("--selftest-heartbeat")
+        guard runsBody || heartbeat else {
             return nil
         }
     }
@@ -44,8 +50,29 @@ enum SelfTestLauncher {
         guard let options = SelfTestOptions(arguments: CommandLine.arguments) else {
             return
         }
+        if options.heartbeat {
+            Thread.detachNewThread {
+                beat()
+            }
+        }
+        guard options.runsBody else {
+            return
+        }
         Thread.detachNewThread {
             SelfTestRun(options: options).run()
+        }
+    }
+
+    private static func beat() {
+        while true {
+            let scheduled = DispatchTime.now()
+            DispatchQueue.main.async {
+                let delay = (DispatchTime.now().uptimeNanoseconds - scheduled.uptimeNanoseconds) / 1_000_000
+                if delay > 100 {
+                    logApply("main stall ms=\(delay)")
+                }
+            }
+            Thread.sleep(forTimeInterval: 0.05)
         }
     }
 }
@@ -58,6 +85,7 @@ final class SelfTestRun: @unchecked Sendable {
     }
 
     static let arranged = DispatchSemaphore(value: 0)
+    static let stopped = DispatchSemaphore(value: 0)
     private static let testMarker = "TGTEST"
     private static let burstCount = 200
 
@@ -221,6 +249,7 @@ final class SelfTestRun: @unchecked Sendable {
         lock.withLock {
             stoppedPid = pid
         }
+        Self.stopped.signal()
         DispatchQueue.global().asyncAfter(deadline: stoppedAt + 10) {
             self.resume()
         }

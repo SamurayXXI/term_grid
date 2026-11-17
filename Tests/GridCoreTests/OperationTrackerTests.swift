@@ -46,4 +46,13 @@ import Testing
         let firstEnd = tracker.end(1, active: false)
         #expect([first, second, secondEnd, firstEnd] == [true, true, true, true])
     }
+
+    @Test func forgetDropsOpenOperation() {
+        var tracker = OperationTracker<Int>()
+        _ = tracker.begin(1)
+        tracker.forget(1)
+        let ended = tracker.end(1, active: false)
+        let reopened = tracker.begin(1)
+        #expect([ended, reopened] == [false, true])
+    }
 }

@@ -80,7 +80,13 @@ final class GridController: ObservableObject {
 
     @Published private(set) var screens: [ScreenOption] = ScreenOption.current()
     @Published private(set) var windows: [DiscoveredWindow] = []
-    @Published private(set) var model = GridModel<AXWindow>(tree: LayoutOps.preset(.twoColumns))
+    @Published private(set) var model = GridModel<AXWindow>(tree: LayoutOps.preset(.twoColumns)) {
+        didSet {
+            if oldValue.bindings != model.bindings || oldValue.detached != model.detached {
+                syncObservation()
+            }
+        }
+    }
     @Published private(set) var selected: Set<AXWindow> = []
     @Published var preset: LayoutPreset = .twoColumns
     @Published var screenID: CGDirectDisplayID? = ScreenOption.current().first?.id
@@ -97,6 +103,13 @@ final class GridController: ObservableObject {
         managesWindows: { [unowned self] pid in self.model.bindings.values.contains { $0.pid == pid } }
     ))
     private var activeDrag: ActiveDrag?
+    private lazy var monitor = AXEventMonitor(mover: mover) { [unowned self] event in
+        self.handle(event)
+    }
+    private var registry = BindingRegistry<AXWindow>()
+    private var echo = EchoFilter<AXWindow>()
+    private var reads = EventReadGate<AXWindow>()
+    private var systemObservers: [NSObjectProtocol] = []
     private var windowInfo: [AXWindow: DiscoveredWindow] = [:]
     private var actualFrames: [CellID: CGRect] = [:]
     private var cellFrames: [CellID: CGRect] = [:]
@@ -105,16 +118,53 @@ final class GridController: ObservableObject {
     private var operationCounter = 0
     private var latestOperation = 0
 
+    init() {
+        let workspace = NSWorkspace.shared.notificationCenter
+        systemObservers.append(workspace.addObserver(
+            forName: NSWorkspace.didTerminateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            let application = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+            guard let pid = application?.processIdentifier else { return }
+            MainActor.assumeIsolated {
+                self?.applicationTerminated(pid)
+            }
+        })
+        systemObservers.append(NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.screensChanged()
+            }
+        })
+        systemObservers.append(NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.mover.restoreAllEnhancedUI(timeout: 1)
+            }
+        })
+    }
+
     var selectedWindows: [DiscoveredWindow] {
         windows.filter { selected.contains($0.window) }
     }
 
     func title(of cell: CellID) -> String? {
-        model.bindings[cell].flatMap { windowInfo[$0]?.displayTitle }
+        (model.bindings[cell] ?? model.detached[cell]).flatMap { windowInfo[$0]?.displayTitle }
     }
 
     func cell(of window: DiscoveredWindow) -> CellID? {
         model.cell(of: window.window)
+    }
+
+    func detachedCell(of window: DiscoveredWindow) -> CellID? {
+        model.detachedCell(of: window.window)
     }
 
     func toggleSelection(_ window: DiscoveredWindow) {
@@ -209,6 +259,16 @@ final class GridController: ObservableObject {
         model.unbind(cell)
         actualFrames[cell] = nil
         refreshDividers()
+    }
+
+    func reattach(_ cell: CellID) {
+        gridLogger.notice("command reattach cell=\(cell.rawValue)")
+        guard model.reattach(cell) != nil else {
+            refreshDividers()
+            return
+        }
+        actualFrames[cell] = nil
+        apply(cells: [cell])
     }
 
     func setDividersHidden(_ hidden: Bool) {
@@ -368,6 +428,7 @@ final class GridController: ObservableObject {
         guard let frame = cellFrames[cell] else { return }
         let generation = model.nextGeneration(for: window)
         operation.outstanding += 1
+        prepareWrite(window)
         mover.request(
             window,
             frame: frame,
@@ -383,6 +444,7 @@ final class GridController: ObservableObject {
 
     private func completed(_ result: ApplyResult, cell: CellID, operation: Operation) {
         operation.outstanding -= 1
+        settleEcho(result)
         let accepted = model.complete(
             window: result.window,
             cell: cell,
@@ -492,6 +554,7 @@ final class GridController: ObservableObject {
     private func submitLive(_ cell: CellID, _ window: AXWindow) {
         guard let frame = cellFrames[cell] else { return }
         let generation = model.nextGeneration(for: window)
+        prepareWrite(window)
         mover.request(
             window,
             frame: frame,
@@ -505,6 +568,7 @@ final class GridController: ObservableObject {
     }
 
     private func completedLive(_ result: ApplyResult, cell: CellID) {
+        settleEcho(result)
         guard result.status == .invalidElement,
               model.complete(
                   window: result.window,
@@ -518,6 +582,135 @@ final class GridController: ObservableObject {
         actualFrames[cell] = nil
         logApply("cell status=\(model.status(of: cell).rawValue) cell=\(cell.rawValue)")
         refreshDividers()
+    }
+
+    private func prepareWrite(_ window: AXWindow) {
+        if let id = registry.id(for: window) {
+            monitor.prepareWrite(window, bindingID: id)
+        }
+        echo.markPending(window)
+    }
+
+    private func settleEcho(_ result: ApplyResult) {
+        switch result.status {
+        case .ok, .clamped, .refused:
+            echo.markCompleted(result.window, actual: result.actual ?? result.requested, at: Self.now())
+        case .timeout:
+            echo.markTimedOut(result.window)
+        case .superseded, .invalidElement:
+            echo.markSettled(result.window)
+        }
+    }
+
+    private func syncObservation() {
+        let windows = Set(model.bindings.values).union(model.detached.values)
+        let change = registry.sync(windows)
+        for entry in change.removed {
+            monitor.unobserve(entry.window, bindingID: entry.id)
+        }
+        for entry in change.added {
+            monitor.observe(entry.window, bindingID: entry.id)
+        }
+    }
+
+    private func handle(_ event: AXEvent) {
+        switch event.kind {
+        case .moved, .resized:
+            guard let window = model.bindings.values.first(where: {
+                $0.pid == event.pid && CFEqual($0.element, event.element)
+            }) else { return }
+            guard !echo.isPending(window) else { return }
+            if reads.request(window) {
+                readFrame(window)
+            }
+        case .destroyed, .miniaturized:
+            guard let id = event.bindingID, let window = registry.window(for: id) else { return }
+            releaseWindow(window, reason: event.kind.rawValue)
+        }
+    }
+
+    private func readFrame(_ window: AXWindow) {
+        mover.readFrame(window) { [weak self] result in
+            self?.frameRead(window, result)
+        }
+    }
+
+    private func frameRead(_ window: AXWindow, _ result: Result<CGRect, AccessFailure>) {
+        if reads.finished(window) {
+            readFrame(window)
+            return
+        }
+        guard let cell = model.cell(of: window) else { return }
+        guard case .success(let current) = result else {
+            logEvent("event read failed cell=\(cell.rawValue)")
+            return
+        }
+        switch echo.classify(window, current: current, at: Self.now()) {
+        case .echo:
+            break
+        case .recovered:
+            logEvent("event recovered cell=\(cell.rawValue)")
+            recover(cell, window)
+        case .external:
+            guard let reference = actualFrames[cell] ?? cellFrames[cell],
+                  let change = ExternalChange.detect(reference: reference, current: current)
+            else { return }
+            model.markDetached(cell)
+            actualFrames[cell] = nil
+            logEvent("detached cell=\(cell.rawValue) reason=\(change.rawValue)")
+            refreshDividers()
+        }
+    }
+
+    private func recover(_ cell: CellID, _ window: AXWindow) {
+        guard !gridRect.isEmpty, cellFrames[cell] != nil else { return }
+        operationCounter += 1
+        let operation = Operation(id: operationCounter, pids: [window.pid], runsFit: false, onFinished: nil)
+        mover.beginOperation(operation.pids)
+        submit(cell, window, operation, reason: .apply)
+    }
+
+    private func releaseWindow(_ window: AXWindow, reason: String) {
+        guard let cell = model.cell(of: window) ?? model.detachedCell(of: window) else { return }
+        model.unbind(cell)
+        actualFrames[cell] = nil
+        echo.forget(window)
+        logEvent("cell empty reason=\(reason) cell=\(cell.rawValue)")
+        refreshDividers()
+    }
+
+    private func applicationTerminated(_ pid: pid_t) {
+        let cells = model.releaseAll { $0.pid == pid }
+        let hadQueue = mover.forget(pid)
+        guard !cells.isEmpty || hadQueue else { return }
+        logEvent("app terminated pid=\(pid) cells=\(cells.count)")
+        for cell in cells {
+            actualFrames[cell] = nil
+            logEvent("cell empty reason=terminated cell=\(cell.rawValue)")
+        }
+        for window in windowInfo.keys where window.pid == pid {
+            echo.forget(window)
+            windowInfo[window] = nil
+        }
+        windows.removeAll { $0.pid == pid }
+        selected = selected.filter { $0.pid != pid }
+        refreshDividers()
+    }
+
+    private func screensChanged() {
+        screens = ScreenOption.current()
+        if !screens.contains(where: { $0.id == screenID }) {
+            let key = NSDeviceDescriptionKey("NSScreenNumber")
+            let main = (NSScreen.main?.deviceDescription[key] as? NSNumber).map { CGDirectDisplayID($0.uint32Value) }
+            screenID = main ?? screens.first?.id
+            logEvent("screen moved to main id=\(screenID.map { String($0) } ?? "none")")
+        }
+        logEvent("screens changed count=\(screens.count)")
+        apply()
+    }
+
+    private nonisolated static func now() -> TimeInterval {
+        ProcessInfo.processInfo.systemUptime
     }
 
     private func layout(_ tree: LayoutNode) {

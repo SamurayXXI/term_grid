@@ -99,6 +99,42 @@ final class WindowMover {
         }
     }
 
+    func queue(for pid: pid_t) -> DispatchQueue {
+        lane(for: pid).queue
+    }
+
+    func readFrame(_ window: AXWindow, completion: @escaping @MainActor (Result<CGRect, AccessFailure>) -> Void) {
+        lane(for: window.pid).queue.async {
+            let result = window.readFrame()
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    completion(result)
+                }
+            }
+        }
+    }
+
+    @discardableResult
+    func forget(_ pid: pid_t) -> Bool {
+        operations.forget(pid)
+        lastFrames = lastFrames.filter { $0.key.pid != pid }
+        return lanes.removeValue(forKey: pid) != nil
+    }
+
+    func restoreAllEnhancedUI(timeout: TimeInterval) {
+        let group = DispatchGroup()
+        for lane in lanes.values {
+            group.enter()
+            lane.queue.async {
+                lane.restoreEnhancedUI()
+                group.leave()
+            }
+        }
+        if group.wait(timeout: .now() + timeout) == .timedOut {
+            logApply("enhanced ui restore timeout")
+        }
+    }
+
     #if DEBUG
     func whenDrained(_ pids: Set<pid_t>, completion: @escaping @MainActor () -> Void) {
         let group = DispatchGroup()

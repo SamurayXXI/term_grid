@@ -12,6 +12,7 @@ public struct GridModel<Window: Hashable & Sendable>: Sendable {
     public private(set) var tree: LayoutNode
     public private(set) var bindings: [CellID: Window] = [:]
     public private(set) var minSizes: [Window: CGSize] = [:]
+    public private(set) var detached: [CellID: Window] = [:]
     private var statuses: [CellID: CellStatus] = [:]
     private var generations: [Window: Int] = [:]
 
@@ -34,6 +35,10 @@ public struct GridModel<Window: Hashable & Sendable>: Sendable {
         bindings.first { $0.value == window }?.key
     }
 
+    public func detachedCell(of window: Window) -> CellID? {
+        detached.first { $0.value == window }?.key
+    }
+
     public var cellMinSizes: [CellID: CGSize] {
         bindings.reduce(into: [:]) { result, entry in
             if let size = minSizes[entry.value] {
@@ -47,6 +52,11 @@ public struct GridModel<Window: Hashable & Sendable>: Sendable {
         guard tree.contains(cell) else { return [] }
         let previousCell = self.cell(of: window)
         if previousCell == cell { return [cell] }
+        for (detachedCell, detachedWindow) in detached where detachedWindow == window {
+            detached[detachedCell] = nil
+            statuses[detachedCell] = nil
+        }
+        detached[cell] = nil
         let displaced = bindings[cell]
         bindings[cell] = window
         statuses[cell] = nil
@@ -67,6 +77,7 @@ public struct GridModel<Window: Hashable & Sendable>: Sendable {
         tree = newTree
         bindings = rebound
         statuses = [:]
+        detached = [:]
     }
 
     @discardableResult
@@ -77,6 +88,7 @@ public struct GridModel<Window: Hashable & Sendable>: Sendable {
         tree = newTree
         bindings = Dictionary(uniqueKeysWithValues: zip(newTree.leafIDs, unique))
         statuses = [:]
+        detached = [:]
         return true
     }
 
@@ -92,6 +104,7 @@ public struct GridModel<Window: Hashable & Sendable>: Sendable {
         guard tree.contains(cell) else { return false }
         bindings[cell] = nil
         statuses[cell] = nil
+        detached[cell] = nil
         if let remaining = LayoutOps.close(tree, cell: cell) {
             tree = remaining
         }
@@ -105,16 +118,37 @@ public struct GridModel<Window: Hashable & Sendable>: Sendable {
     public mutating func unbind(_ cell: CellID) {
         bindings[cell] = nil
         statuses[cell] = nil
+        detached[cell] = nil
     }
 
     public mutating func markDetached(_ cell: CellID) {
+        detached[cell] = bindings[cell]
         bindings[cell] = nil
         statuses[cell] = .detached
+    }
+
+    public mutating func reattach(_ cell: CellID) -> Window? {
+        guard let window = detached.removeValue(forKey: cell) else { return nil }
+        statuses[cell] = nil
+        guard tree.contains(cell), self.cell(of: window) == nil else { return nil }
+        bindings[cell] = window
+        return window
+    }
+
+    public mutating func releaseAll(where matches: (Window) -> Bool) -> [CellID] {
+        let cells = cells.filter { cell in
+            (bindings[cell] ?? detached[cell]).map(matches) ?? false
+        }
+        for cell in cells {
+            unbind(cell)
+        }
+        return cells
     }
 
     public mutating func reset() {
         bindings = [:]
         statuses = [:]
+        detached = [:]
     }
 
     public mutating func nextGeneration(for window: Window) -> Int {
