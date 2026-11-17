@@ -21,11 +21,16 @@ private struct WindowReader: NSViewRepresentable {
 struct MenuContent: View {
     @ObservedObject var permissions: Permissions
     @ObservedObject var controller: GridController
+    @ObservedObject private var stageManager = StageManager.shared
     @State private var hostWindow: NSWindow?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             if permissions.isTrusted {
+                if stageManager.isEnabled {
+                    stageManagerWarning
+                    Divider()
+                }
                 gridSection
                 Divider()
                 cellsSection
@@ -43,6 +48,7 @@ struct MenuContent: View {
         .frame(width: 320)
         .background(WindowReader(window: $hostWindow))
         .onAppear {
+            stageManager.refresh()
             if permissions.isTrusted {
                 controller.refreshWindows()
             }
@@ -54,11 +60,23 @@ struct MenuContent: View {
             else {
                 return
             }
+            stageManager.refresh()
             controller.refreshWindows()
         }
         .onChange(of: permissions.isTrusted) { _, trusted in
             if trusted {
                 controller.refreshWindows()
+            }
+        }
+    }
+
+    private var stageManagerWarning: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Включён Stage Manager: окна группируются по приложениям, раскладка может работать неправильно. Отключите его в настройках.")
+                .foregroundStyle(Color.orange)
+                .fixedSize(horizontal: false, vertical: true)
+            Button("Открыть настройки Рабочего стола и Dock") {
+                stageManager.openSettings()
             }
         }
     }
