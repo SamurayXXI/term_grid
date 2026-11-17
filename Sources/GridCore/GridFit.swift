@@ -11,6 +11,12 @@ public struct FitPlan: Sendable {
     public let skipped: [DividerID]
 }
 
+public enum DividerFit: Equatable, Sendable {
+    case notApplicable
+    case skipped
+    case adjusted(tree: LayoutNode, frames: [CellID: CGRect], delta: CGFloat)
+}
+
 public enum GridFit {
     public static func outerEdges(of cell: CGRect, in grid: CGRect, tolerance: CGFloat = 0.5) -> OuterEdges {
         var edges: OuterEdges = []
@@ -56,34 +62,56 @@ public enum GridFit {
         var adjustments: [FitAdjustment] = []
         var skipped: [DividerID] = []
         for id in Dividers.compute(tree, frames: cellFrames, gap: gap).map(\.id) {
-            guard let divider = Dividers.compute(current, frames: frames, gap: gap).first(where: { $0.id == id }) else {
-                continue
-            }
-            let (near, far) = adjacentCells(of: divider, in: current, cellFrames: frames)
-            guard !near.isEmpty, !far.isEmpty, (near + far).allSatisfy(isTerminalCell) else { continue }
-            guard let next = FitPolicy.adjust(
-                current,
-                divider: divider,
-                actualFrames: actuals,
+            switch fit(
+                divider: id,
+                tree: current,
                 cellFrames: frames,
-                gap: gap
-            ) else {
-                skipped.append(id)
+                actualFrames: actuals,
+                gap: gap,
+                isTerminalCell: isTerminalCell,
+                solve: solve
+            ) {
+            case .notApplicable:
                 continue
+            case .skipped:
+                skipped.append(id)
+            case .adjusted(let next, let nextFrames, let delta):
+                adjustments.append(FitAdjustment(divider: id, delta: delta))
+                actuals = carry(actuals, from: frames, to: nextFrames)
+                current = next
+                frames = nextFrames
             }
-            let nextFrames = solve(next)
-            if let (axis, children) = Dividers.container(in: current, id: id.container) {
-                let nearNode = children[id.index].node
-                let before = Dividers.extent(Dividers.bounds(of: nearNode, frames: frames), axis)
-                let after = Dividers.extent(Dividers.bounds(of: nearNode, frames: nextFrames), axis)
-                adjustments.append(FitAdjustment(divider: id, delta: before - after))
-            }
-            actuals = carry(actuals, from: frames, to: nextFrames)
-            current = next
-            frames = nextFrames
         }
         guard !adjustments.isEmpty || !skipped.isEmpty else { return nil }
         return FitPlan(tree: current, adjustments: adjustments, skipped: skipped)
+    }
+
+    public static func fit(
+        divider id: DividerID,
+        tree: LayoutNode,
+        cellFrames: [CellID: CGRect],
+        actualFrames: [CellID: CGRect],
+        gap: CGFloat,
+        isTerminalCell: (CellID) -> Bool,
+        solve: (LayoutNode) -> [CellID: CGRect]
+    ) -> DividerFit {
+        guard let divider = Dividers.compute(tree, frames: cellFrames, gap: gap).first(where: { $0.id == id }),
+              let (axis, children) = Dividers.container(in: tree, id: id.container)
+        else { return .notApplicable }
+        let (near, far) = adjacentCells(of: divider, in: tree, cellFrames: cellFrames)
+        guard !near.isEmpty, !far.isEmpty, (near + far).allSatisfy(isTerminalCell) else { return .notApplicable }
+        guard let next = FitPolicy.adjust(
+            tree,
+            divider: divider,
+            actualFrames: actualFrames,
+            cellFrames: cellFrames,
+            gap: gap
+        ) else { return .skipped }
+        let nextFrames = solve(next)
+        let nearNode = children[id.index].node
+        let before = Dividers.extent(Dividers.bounds(of: nearNode, frames: cellFrames), axis)
+        let after = Dividers.extent(Dividers.bounds(of: nearNode, frames: nextFrames), axis)
+        return .adjusted(tree: next, frames: nextFrames, delta: before - after)
     }
 
     private static func carry(

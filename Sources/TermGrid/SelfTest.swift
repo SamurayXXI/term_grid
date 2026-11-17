@@ -57,6 +57,7 @@ final class SelfTestRun: @unchecked Sendable {
         let frame: CGRect
     }
 
+    static let arranged = DispatchSemaphore(value: 0)
     private static let testMarker = "TGTEST"
     private static let burstCount = 200
 
@@ -147,6 +148,7 @@ final class SelfTestRun: @unchecked Sendable {
             controller.assignAll(assignments, onFinished: done)
         }
         logApply("selftest arranged windows=\(bound.count) preset=\(options.presetName)")
+        Self.arranged.signal()
         guard let stop = options.stop else {
             return
         }

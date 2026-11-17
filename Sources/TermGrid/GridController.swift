@@ -55,16 +55,25 @@ final class GridController: ObservableObject {
         let id: Int
         let pids: Set<pid_t>
         let runsFit: Bool
+        let fitDivider: DividerID?
         var outstanding = 0
         var fitStarted = false
         var onFinished: (() -> Void)?
 
-        init(id: Int, pids: Set<pid_t>, runsFit: Bool, onFinished: (() -> Void)?) {
+        init(id: Int, pids: Set<pid_t>, runsFit: Bool, fitDivider: DividerID? = nil, onFinished: (() -> Void)?) {
             self.id = id
             self.pids = pids
             self.runsFit = runsFit
+            self.fitDivider = fitDivider
             self.onFinished = onFinished
         }
+    }
+
+    private struct ActiveDrag {
+        let plan: DividerDrag
+        let operation: Operation
+        let targets: [(CellID, AXWindow)]
+        var tree: LayoutNode
     }
 
     let presets = LayoutPreset.allCases
@@ -76,8 +85,18 @@ final class GridController: ObservableObject {
     @Published var preset: LayoutPreset = .twoColumns
     @Published var screenID: CGDirectDisplayID? = ScreenOption.current().first?.id
     @Published var gap: Int = 8
+    @Published private(set) var dividersHidden = false
+    private(set) var shownDividers: [Divider] = []
 
     private let mover = WindowMover()
+    private lazy var overlay = DividerOverlay(handlers: DividerOverlay.Handlers(
+        begin: { [unowned self] id, point in self.beginDrag(id, at: point) },
+        move: { [unowned self] point in self.moveDrag(to: point) },
+        end: { [unowned self] point in self.endDrag(at: point) },
+        cancel: { [unowned self] in self.cancelDrag() },
+        managesWindows: { [unowned self] pid in self.model.bindings.values.contains { $0.pid == pid } }
+    ))
+    private var activeDrag: ActiveDrag?
     private var windowInfo: [AXWindow: DiscoveredWindow] = [:]
     private var actualFrames: [CellID: CGRect] = [:]
     private var cellFrames: [CellID: CGRect] = [:]
@@ -189,6 +208,13 @@ final class GridController: ObservableObject {
         gridLogger.notice("command release cell=\(cell.rawValue)")
         model.unbind(cell)
         actualFrames[cell] = nil
+        refreshDividers()
+    }
+
+    func setDividersHidden(_ hidden: Bool) {
+        gridLogger.notice("command setDividersHidden \(hidden)")
+        dividersHidden = hidden
+        refreshDividers()
     }
 
     func retry(_ cell: CellID) {
@@ -208,9 +234,70 @@ final class GridController: ObservableObject {
 
     func reset() {
         gridLogger.notice("command reset")
+        cancelDrag()
         model.reset()
         selected = []
         actualFrames = [:]
+        refreshDividers()
+    }
+
+    func beginDrag(_ id: DividerID, at point: CGPoint) -> Bool {
+        cancelDrag()
+        guard !gridRect.isEmpty else { return false }
+        cellFrames = solve(model.tree, in: gridRect)
+        guard let plan = DividerDrag(tree: model.tree, divider: id, frames: cellFrames, gap: CGFloat(gap), origin: point) else {
+            return false
+        }
+        let targets = boundTargets(cells: Set(plan.cells), pids: nil)
+        operationCounter += 1
+        latestOperation = operationCounter
+        let operation = Operation(
+            id: operationCounter,
+            pids: Set(targets.map { $0.1.pid }),
+            runsFit: false,
+            fitDivider: id,
+            onFinished: nil
+        )
+        mover.beginOperation(operation.pids)
+        activeDrag = ActiveDrag(plan: plan, operation: operation, targets: targets, tree: model.tree)
+        gridLogger.notice("drag begin divider=\(Self.describe(id), privacy: .public) windows=\(targets.count)")
+        return true
+    }
+
+    func moveDrag(to point: CGPoint) {
+        guard var drag = activeDrag else { return }
+        let next = drag.plan.tree(to: point, minSizes: model.cellMinSizes, minCell: Self.minCell)
+        guard next != drag.tree else { return }
+        drag.tree = next
+        activeDrag = drag
+        let previous = cellFrames
+        layout(next)
+        for (cell, window) in drag.targets where model.bindings[cell] == window {
+            guard let old = previous[cell], let new = cellFrames[cell], !Self.sameRect(old, new) else { continue }
+            submitLive(cell, window)
+        }
+    }
+
+    func endDrag(at point: CGPoint) {
+        guard let drag = activeDrag else { return }
+        activeDrag = nil
+        layout(drag.plan.tree(to: point, minSizes: model.cellMinSizes, minCell: Self.minCell))
+        let delta = String(format: "%.1f", Double(drag.plan.delta(to: point)))
+        gridLogger.notice("drag end divider=\(Self.describe(drag.plan.divider.id), privacy: .public) delta=\(delta, privacy: .public)")
+        for (cell, window) in drag.targets where model.bindings[cell] == window {
+            submit(cell, window, drag.operation, reason: .drag)
+        }
+        if drag.operation.outstanding == 0 {
+            finish(drag.operation)
+        }
+    }
+
+    func cancelDrag() {
+        guard let drag = activeDrag else { return }
+        activeDrag = nil
+        overlay.dragCancelled()
+        gridLogger.notice("drag cancelled divider=\(Self.describe(drag.plan.divider.id), privacy: .public)")
+        mover.endOperation(drag.operation.pids)
     }
 
     private func screen(for id: CGDirectDisplayID?) -> NSScreen? {
@@ -237,13 +324,17 @@ final class GridController: ObservableObject {
         runsFit: Bool = true,
         onFinished: (() -> Void)? = nil
     ) {
+        cancelDrag()
         guard let grid = gridRectInAX() else {
             logApply("apply skipped no screen")
+            gridRect = .zero
+            refreshDividers()
             onFinished?()
             return
         }
         gridRect = grid
         cellFrames = solve(model.tree, in: grid)
+        refreshDividers()
         let targets = boundTargets(cells: cells, pids: pids)
         guard !targets.isEmpty else {
             onFinished?()
@@ -306,6 +397,7 @@ final class GridController: ObservableObject {
             }
             if model.bindings[cell] == nil {
                 actualFrames[cell] = nil
+                refreshDividers()
             }
             logApply("cell status=\(model.status(of: cell).rawValue) cell=\(cell.rawValue)")
         } else {
@@ -320,48 +412,131 @@ final class GridController: ObservableObject {
     }
 
     private func finish(_ operation: Operation) {
-        if operation.runsFit, !operation.fitStarted, operation.id == latestOperation, startFit(operation) {
-            return
+        if !operation.fitStarted, operation.id == latestOperation {
+            operation.fitStarted = true
+            if let divider = operation.fitDivider {
+                if startDividerFit(operation, divider) {
+                    return
+                }
+            } else if operation.runsFit, startFit(operation) {
+                return
+            }
         }
         mover.endOperation(operation.pids)
         operation.onFinished?()
         operation.onFinished = nil
     }
 
+    private func isTerminalCell(_ cell: CellID) -> Bool {
+        guard let window = model.bindings[cell], let bundleId = windowInfo[window]?.bundleId else { return false }
+        return Self.terminalBundleIds.contains(bundleId)
+    }
+
     private func startFit(_ operation: Operation) -> Bool {
-        operation.fitStarted = true
         let grid = gridRect
-        let isTerminal: (CellID) -> Bool = { [model, windowInfo] cell in
-            guard let window = model.bindings[cell], let bundleId = windowInfo[window]?.bundleId else { return false }
-            return Self.terminalBundleIds.contains(bundleId)
-        }
         guard let plan = GridFit.plan(
             tree: model.tree,
             cellFrames: cellFrames,
             actualFrames: actualFrames,
             gap: CGFloat(gap),
-            isTerminalCell: isTerminal,
+            isTerminalCell: isTerminalCell,
             solve: { solve($0, in: grid) }
         ) else { return false }
         for id in plan.skipped {
-            logApply("fit skipped divider=\(id.container.rawValue).\(id.index)")
+            logApply("fit skipped divider=\(Self.describe(id))")
         }
         guard !plan.adjustments.isEmpty else { return false }
         for adjustment in plan.adjustments {
-            let id = adjustment.divider
-            logApply(
-                "fit adjusted divider=\(id.container.rawValue).\(id.index)"
-                    + " delta=\(String(format: "%.1f", Double(adjustment.delta)))"
-            )
+            logFitAdjusted(adjustment.divider, delta: adjustment.delta)
         }
+        return submitFit(plan.tree, operation)
+    }
+
+    private func startDividerFit(_ operation: Operation, _ id: DividerID) -> Bool {
+        let grid = gridRect
+        switch GridFit.fit(
+            divider: id,
+            tree: model.tree,
+            cellFrames: cellFrames,
+            actualFrames: actualFrames,
+            gap: CGFloat(gap),
+            isTerminalCell: isTerminalCell,
+            solve: { solve($0, in: grid) }
+        ) {
+        case .notApplicable:
+            logApply("fit skipped divider=\(Self.describe(id)) reason=notApplicable")
+            return false
+        case .skipped:
+            logApply("fit skipped divider=\(Self.describe(id))")
+            return false
+        case .adjusted(let tree, _, let delta):
+            logFitAdjusted(id, delta: delta)
+            return submitFit(tree, operation)
+        }
+    }
+
+    private func logFitAdjusted(_ id: DividerID, delta: CGFloat) {
+        logApply("fit adjusted divider=\(Self.describe(id)) delta=\(String(format: "%.1f", Double(delta)))")
+    }
+
+    private func submitFit(_ tree: LayoutNode, _ operation: Operation) -> Bool {
         let previous = cellFrames
-        model.replaceTree(plan.tree)
-        cellFrames = solve(plan.tree, in: grid)
+        layout(tree)
         for (cell, window) in boundTargets(cells: nil, pids: nil) {
             guard let old = previous[cell], let new = cellFrames[cell], !Self.sameRect(old, new) else { continue }
             submit(cell, window, operation, reason: .fit)
         }
         return operation.outstanding > 0
+    }
+
+    private func submitLive(_ cell: CellID, _ window: AXWindow) {
+        guard let frame = cellFrames[cell] else { return }
+        let generation = model.nextGeneration(for: window)
+        mover.request(
+            window,
+            frame: frame,
+            generation: generation,
+            final: false,
+            reason: .live,
+            cell: cell
+        ) { [weak self] result in
+            self?.completedLive(result, cell: cell)
+        }
+    }
+
+    private func completedLive(_ result: ApplyResult, cell: CellID) {
+        guard result.status == .invalidElement,
+              model.complete(
+                  window: result.window,
+                  cell: cell,
+                  generation: result.generation,
+                  status: result.status,
+                  requested: result.requested,
+                  actual: result.actual
+              )
+        else { return }
+        actualFrames[cell] = nil
+        logApply("cell status=\(model.status(of: cell).rawValue) cell=\(cell.rawValue)")
+        refreshDividers()
+    }
+
+    private func layout(_ tree: LayoutNode) {
+        model.replaceTree(tree)
+        cellFrames = solve(tree, in: gridRect)
+        refreshDividers()
+    }
+
+    private func refreshDividers() {
+        let visible = !dividersHidden && !model.bindings.isEmpty && !gridRect.isEmpty
+        let dividers = visible
+            ? Dividers.compute(model.tree, frames: cellFrames, gap: CGFloat(gap)).filter(\.isGrabbable)
+            : []
+        shownDividers = dividers
+        overlay.show(dividers, primaryHeight: NSScreen.screens.first?.frame.height ?? 0)
+    }
+
+    private nonisolated static func describe(_ id: DividerID) -> String {
+        "\(id.container.rawValue).\(id.index)"
     }
 
     private nonisolated static func sameRect(_ a: CGRect, _ b: CGRect) -> Bool {

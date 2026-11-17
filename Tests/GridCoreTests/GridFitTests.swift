@@ -96,6 +96,61 @@ import Testing
         #expect(plan.adjustments.map(\.delta) == [5, 6])
     }
 
+    @Test func fitOfDraggedDividerBetweenTerminalsAdjustsByDeficit() {
+        let tree = LayoutOps.preset(.grid2x2)
+        let frames = solve(tree)
+        let id = Dividers.compute(tree, frames: frames, gap: gap).first { $0.axis == .horizontal }!.id
+        let actual = shrunk(frames, [CellID(0): CGSize(width: 6, height: 0), CellID(2): CGSize(width: 3, height: 0)])
+        let result = GridFit.fit(
+            divider: id, tree: tree, cellFrames: frames, actualFrames: actual, gap: gap,
+            isTerminalCell: { _ in true }, solve: solve
+        )
+        guard case .adjusted(let next, let nextFrames, let delta) = result else {
+            Issue.record("expected adjusted, got \(result)")
+            return
+        }
+        #expect(delta == 6)
+        #expect(nextFrames == solve(next))
+        #expect(nextFrames[CellID(0)]!.width == frames[CellID(0)]!.width - 6)
+        #expect(nextFrames[CellID(2)]! == frames[CellID(2)]!)
+    }
+
+    @Test func fitOfDraggedDividerIsNotApplicableWithNonTerminalNeighbour() {
+        let tree = LayoutOps.preset(.twoColumns)
+        let frames = solve(tree)
+        let id = Dividers.compute(tree, frames: frames, gap: gap)[0].id
+        let actual = shrunk(frames, [CellID(0): CGSize(width: 7, height: 0)])
+        let result = GridFit.fit(
+            divider: id, tree: tree, cellFrames: frames, actualFrames: actual, gap: gap,
+            isTerminalCell: { $0 == CellID(0) }, solve: solve
+        )
+        #expect(result == .notApplicable)
+    }
+
+    @Test func fitOfDraggedDividerIsSkippedWhenDeficitOutOfRange() {
+        let tree = LayoutOps.preset(.twoColumns)
+        let frames = solve(tree)
+        let id = Dividers.compute(tree, frames: frames, gap: gap)[0].id
+        for deficit in [CGFloat(0.5), 50] {
+            let actual = shrunk(frames, [CellID(0): CGSize(width: deficit, height: 0)])
+            let result = GridFit.fit(
+                divider: id, tree: tree, cellFrames: frames, actualFrames: actual, gap: gap,
+                isTerminalCell: { _ in true }, solve: solve
+            )
+            #expect(result == .skipped)
+        }
+    }
+
+    @Test func fitOfUnknownDividerIsNotApplicable() {
+        let tree = LayoutOps.preset(.twoColumns)
+        let frames = solve(tree)
+        let result = GridFit.fit(
+            divider: DividerID(container: ContainerID(77), index: 0), tree: tree, cellFrames: frames,
+            actualFrames: frames, gap: gap, isTerminalCell: { _ in true }, solve: solve
+        )
+        #expect(result == .notApplicable)
+    }
+
     @Test func planLeavesOuterEdgeUntouched() {
         let tree = LayoutOps.preset(.twoColumns)
         let frames = solve(tree)

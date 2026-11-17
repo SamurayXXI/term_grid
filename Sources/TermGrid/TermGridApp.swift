@@ -3,90 +3,11 @@ import AppKit
 import ApplicationServices
 import os
 import ProbeKit
-
-private let spikeLogger = Logger(subsystem: "local.termgrid", category: "ui")
-
-final class SpikePanelView: NSView {
-    override var acceptsFirstResponder: Bool { true }
-
-    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        for area in trackingAreas {
-            removeTrackingArea(area)
-        }
-        addTrackingArea(NSTrackingArea(
-            rect: .zero,
-            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
-            owner: self,
-            userInfo: nil
-        ))
-    }
-
-    override func mouseEntered(with event: NSEvent) {
-        NSCursor.resizeLeftRight.set()
-        spikeLogger.notice("spike panel mouseEntered")
-    }
-
-    override func mouseExited(with event: NSEvent) {
-        NSCursor.arrow.set()
-        spikeLogger.notice("spike panel mouseExited")
-    }
-
-    override func mouseDown(with event: NSEvent) {
-        spikeLogger.notice("spike panel mouseDown")
-    }
-
-    override func mouseDragged(with event: NSEvent) {
-        spikeLogger.notice("spike panel mouseDragged dx=\(event.deltaX) dy=\(event.deltaY)")
-    }
-
-    override func mouseUp(with event: NSEvent) {
-        spikeLogger.notice("spike panel mouseUp")
-    }
-}
-
-final class SpikePanel: NSPanel {
-    override var canBecomeKey: Bool { false }
-    override var canBecomeMain: Bool { false }
-}
-
-enum SpikeLauncher {
-    static var panel: NSPanel?
-
-    static func start() {
-        spikeLogger.notice("AXIsProcessTrusted=\(AXIsProcessTrusted())")
-        let arguments = CommandLine.arguments
-        guard let flag = arguments.firstIndex(of: "--spike-panel") else {
-            return
-        }
-        let numbers = arguments.dropFirst(flag + 1).prefix(4).compactMap { Double($0) }
-        let frame = numbers.count == 4
-            ? NSRect(x: numbers[0], y: numbers[1], width: numbers[2], height: numbers[3])
-            : NSRect(x: 300, y: 300, width: 8, height: 400)
-        let level: NSWindow.Level = arguments.contains("--spike-floating") ? .floating : .normal
-        DispatchQueue.main.async {
-            let panel = SpikePanel(
-                contentRect: frame,
-                styleMask: [.borderless, .nonactivatingPanel],
-                backing: .buffered,
-                defer: false
-            )
-            panel.isOpaque = false
-            panel.backgroundColor = NSColor(white: 0, alpha: 0.01)
-            panel.level = level
-            panel.collectionBehavior = [.ignoresCycle, .fullScreenNone]
-            panel.hidesOnDeactivate = false
-            panel.contentView = SpikePanelView(frame: NSRect(origin: .zero, size: frame.size))
-            panel.orderFrontRegardless()
-            spikeLogger.notice("spike panel shown frame=\(NSStringFromRect(frame)) pid=\(ProcessInfo.processInfo.processIdentifier)")
-            SpikeLauncher.panel = panel
-        }
-    }
-}
+import GridCore
 
 #if DEBUG
+private let probeLogger = Logger(subsystem: "local.termgrid", category: "ui")
+
 enum ProbeLauncher {
     static func start() {
         let arguments = CommandLine.arguments
@@ -95,13 +16,13 @@ enum ProbeLauncher {
         }
         let requestPath = arguments[flag + 1]
         guard let outFlag = arguments.firstIndex(of: "--probe-out"), outFlag + 1 < arguments.count else {
-            spikeLogger.error("probe: --probe-out is required")
+            probeLogger.error("probe: --probe-out is required")
             exit(1)
         }
         let outPath = arguments[outFlag + 1]
         FileManager.default.createFile(atPath: outPath, contents: nil)
         guard let handle = FileHandle(forWritingAtPath: outPath) else {
-            spikeLogger.error("probe: cannot open \(outPath)")
+            probeLogger.error("probe: cannot open \(outPath)")
             exit(1)
         }
         let write: ProbeSink = { record in
@@ -137,7 +58,7 @@ enum ProbeLauncher {
         do {
             try Probe.requireTrust()
         } catch let error as ProbeError {
-            spikeLogger.error("probe: \(error.message)")
+            probeLogger.error("probe: \(error.message)")
             write(["type": "error", "message": error.message, "code": Int(error.code)])
             return error.code
         } catch {
@@ -156,9 +77,20 @@ enum ProbeLauncher {
             write(["type": "error", "message": "cannot read request: \(error.localizedDescription)", "code": 1])
             return 1
         }
+        if SelfTestOptions(arguments: CommandLine.arguments)?.arrange.isEmpty == false {
+            guard SelfTestRun.arranged.wait(timeout: .now() + 150) == .success else {
+                write(["type": "error", "message": "grid not arranged", "code": 4])
+                return 4
+            }
+        }
         for request in requests {
             do {
-                if Probe.runsOnMainThread(request["cmd"] as? String) {
+                let command = request["cmd"] as? String
+                if command == "dividers" {
+                    write(["type": "dividers", "dividers": shownDividers().map(describe)])
+                } else if command == "drag", request["divider"] != nil {
+                    try Probe.execute(try resolveDividerDrag(request, emit: write), emit: write)
+                } else if Probe.runsOnMainThread(command) {
                     try DispatchQueue.main.sync { try Probe.execute(request, emit: write) }
                 } else {
                     try Probe.execute(request, emit: write)
@@ -173,6 +105,51 @@ enum ProbeLauncher {
         }
         return 0
     }
+
+    private static func shownDividers() -> [GridCore.Divider] {
+        DispatchQueue.main.sync {
+            MainActor.assumeIsolated {
+                GridController.shared.shownDividers
+            }
+        }
+    }
+
+    private static func describe(_ divider: GridCore.Divider) -> [String: Any] {
+        [
+            "id": "\(divider.id.container.rawValue).\(divider.id.index)",
+            "axis": divider.axis.rawValue,
+            "x": Double(divider.rect.minX),
+            "y": Double(divider.rect.minY),
+            "w": Double(divider.rect.width),
+            "h": Double(divider.rect.height),
+        ]
+    }
+
+    private static func resolveDividerDrag(_ request: [String: Any], emit: ProbeSink) throws -> [String: Any] {
+        let dividers = shownDividers()
+        guard let index = (request["divider"] as? NSNumber)?.intValue, dividers.indices.contains(index) else {
+            throw ProbeError(3, "divider index out of range (shown: \(dividers.count))")
+        }
+        let along = (request["along"] as? NSNumber)?.doubleValue ?? 0.5
+        let dx = (request["dx"] as? NSNumber)?.doubleValue ?? 0
+        let dy = (request["dy"] as? NSNumber)?.doubleValue ?? 0
+        let start = dividers[index].point(along: CGFloat(along))
+        var resolved = request
+        resolved["divider"] = nil
+        resolved["x1"] = Double(start.x)
+        resolved["y1"] = Double(start.y)
+        resolved["x2"] = Double(start.x) + dx
+        resolved["y2"] = Double(start.y) + dy
+        emit([
+            "type": "drag-target",
+            "divider": describe(dividers[index]),
+            "x1": Double(start.x),
+            "y1": Double(start.y),
+            "x2": Double(start.x) + dx,
+            "y2": Double(start.y) + dy,
+        ])
+        return resolved
+    }
 }
 #endif
 
@@ -183,7 +160,6 @@ struct TermGridApp: App {
 
     init() {
         AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), AXWindow.messagingTimeout)
-        SpikeLauncher.start()
         #if DEBUG
         ProbeLauncher.start()
         SelfTestLauncher.start()

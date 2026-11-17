@@ -48,7 +48,7 @@ for _ in $(seq 1 $((limit * 5))); do
 done
 
 /usr/bin/log show --start "$started" --style compact --predicate 'subsystem == "local.termgrid"' \
-    | grep -E 'apply |selftest|ax timeout|windows discovered|no windows|enhanced ui|fit residual' || true
+    | grep -E 'apply |selftest|ax timeout|windows discovered|no windows|enhanced ui|fit |cell status|drag |dividers ' || true
 
 if [ "$finished" != 1 ]; then
     echo "timeout waiting for selftest to finish" >&2

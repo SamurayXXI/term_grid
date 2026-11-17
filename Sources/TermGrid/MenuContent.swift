@@ -94,6 +94,7 @@ struct MenuContent: View {
                     Text("\(gap) pt").tag(gap)
                 }
             }
+            Toggle("Скрыть разделители", isOn: dividersHiddenBinding)
             HStack {
                 Button("Разложить автоматически") {
                     controller.autoArrange(controller.selectedWindows)
@@ -220,6 +221,10 @@ struct MenuContent: View {
 
     private var gapBinding: Binding<Int> {
         Binding(get: { controller.gap }, set: { controller.setGap($0) })
+    }
+
+    private var dividersHiddenBinding: Binding<Bool> {
+        Binding(get: { controller.dividersHidden }, set: { controller.setDividersHidden($0) })
     }
 
     private func icon(for window: DiscoveredWindow) -> NSImage {
