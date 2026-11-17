@@ -9,6 +9,8 @@ import GridCore
 struct SelfTestOptions {
     var move: String?
     var burst: [String]
+    var arrange: [String]
+    var presetName: String
     var stop: String?
     var discover: Bool
 
@@ -24,9 +26,14 @@ struct SelfTestOptions {
             .split(separator: ",")
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty } ?? []
+        arrange = value("--selftest-arrange")?
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty } ?? []
+        presetName = value("--selftest-preset") ?? "twoColumns"
         stop = value("--selftest-stop")
         discover = arguments.contains("--selftest-discover")
-        guard move != nil || !burst.isEmpty || stop != nil || discover else {
+        guard move != nil || !burst.isEmpty || !arrange.isEmpty || stop != nil || discover else {
             return nil
         }
     }
@@ -62,9 +69,10 @@ final class SelfTestRun: @unchecked Sendable {
         self.options = options
     }
 
-    func run() -> Never {
-        if options.move != nil, !options.burst.isEmpty {
-            logApply("selftest move and burst are exclusive")
+    func run() {
+        let modes = [options.move != nil, !options.burst.isEmpty, !options.arrange.isEmpty].filter { $0 }.count
+        if modes > 1 {
+            logApply("selftest move, burst and arrange are exclusive")
             finish(1)
         }
         ProbeLauncher.awaitTrust(timeout: 90)
@@ -74,6 +82,10 @@ final class SelfTestRun: @unchecked Sendable {
         }
         let snapshot = WindowDiscovery.snapshot()
         let bound = bind(snapshot)
+        if !options.arrange.isEmpty {
+            runArrange(bound)
+            return
+        }
         let stoppedAt = options.stop.map { suspend($0) }
         if options.discover {
             discover()
@@ -92,7 +104,7 @@ final class SelfTestRun: @unchecked Sendable {
     }
 
     private func bind(_ snapshot: [DiscoveredWindow]) -> [BoundWindow] {
-        let entries = options.move.map { [$0] } ?? options.burst
+        let entries = options.move.map { [$0] } ?? (options.arrange.isEmpty ? options.burst : options.arrange)
         var occurrences: [String: Int] = [:]
         var bound: [BoundWindow] = []
         for (cell, entry) in entries.enumerated() {
@@ -119,6 +131,74 @@ final class SelfTestRun: @unchecked Sendable {
             finish(0)
         }
         return bound
+    }
+
+    private func runArrange(_ bound: [BoundWindow]) {
+        guard let preset = Self.preset(named: options.presetName) else {
+            logApply("selftest unknown preset name=\(options.presetName)")
+            finish(1)
+        }
+        awaitMain(timeout: 30) { controller, done in
+            controller.setPreset(preset)
+            let cells = controller.model.cells
+            let assignments = bound.compactMap { target -> (DiscoveredWindow, CellID)? in
+                target.cell < cells.count ? (target.window, cells[target.cell]) : nil
+            }
+            controller.assignAll(assignments, onFinished: done)
+        }
+        logApply("selftest arranged windows=\(bound.count) preset=\(options.presetName)")
+        guard let stop = options.stop else {
+            return
+        }
+        let stoppedAt = suspend(stop)
+        if options.discover {
+            discover()
+        }
+        if let pid = lock.withLock({ stoppedPid }) {
+            logApply("selftest body=stoppedReapply")
+            awaitMain(timeout: 10) { controller, done in
+                controller.reapply(pids: [pid], onFinished: done)
+            }
+        }
+        hold(from: stoppedAt)
+        Thread.sleep(forTimeInterval: 1)
+        awaitMain(timeout: 30) { controller, done in
+            controller.reapply(onFinished: done)
+        }
+        logApply("selftest done")
+        finish(0)
+    }
+
+    private func awaitMain(
+        timeout: TimeInterval,
+        _ body: @escaping @MainActor (GridController, @escaping () -> Void) -> Void
+    ) {
+        let done = DispatchSemaphore(value: 0)
+        DispatchQueue.main.async {
+            MainActor.assumeIsolated {
+                body(GridController.shared) {
+                    done.signal()
+                }
+            }
+        }
+        if done.wait(timeout: .now() + timeout) == .timedOut {
+            logApply("selftest incomplete")
+            if timeout >= 30 {
+                finish(1)
+            }
+        }
+    }
+
+    private static func preset(named name: String) -> LayoutPreset? {
+        switch name {
+        case "twoColumns": .twoColumns
+        case "threeColumns": .threeColumns
+        case "twoRows": .twoRows
+        case "grid2x2": .grid2x2
+        case "onePlusTwo": .onePlusTwo
+        case "grid2x3": .grid2x3
+        default: nil
+        }
     }
 
     private func suspend(_ target: String) -> DispatchTime {

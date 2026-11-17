@@ -179,7 +179,7 @@ enum ProbeLauncher {
 @main
 struct TermGridApp: App {
     @StateObject private var permissions = Permissions()
-    @StateObject private var controller = GridController()
+    @StateObject private var controller = GridController.shared
 
     init() {
         AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), AXWindow.messagingTimeout)

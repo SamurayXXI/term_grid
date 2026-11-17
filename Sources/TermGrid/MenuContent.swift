@@ -28,6 +28,8 @@ struct MenuContent: View {
             if permissions.isTrusted {
                 gridSection
                 Divider()
+                cellsSection
+                Divider()
                 windowsSection
             } else {
                 onboarding
@@ -94,12 +96,60 @@ struct MenuContent: View {
             }
             HStack {
                 Button("Разложить автоматически") {
-                    controller.autoArrange()
+                    controller.autoArrange(controller.selectedWindows)
                 }
+                .disabled(controller.selected.isEmpty)
                 Button("Сбросить") {
                     controller.reset()
                 }
             }
+        }
+    }
+
+    private var cellsSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Ячейки")
+                .font(.headline)
+            ForEach(Array(controller.model.cells.enumerated()), id: \.element) { index, cell in
+                cellRow(index: index, cell: cell)
+            }
+        }
+    }
+
+    private func cellRow(index: Int, cell: CellID) -> some View {
+        let status = controller.model.status(of: cell)
+        return HStack(spacing: 6) {
+            Text("\(index + 1)")
+                .monospacedDigit()
+                .frame(width: 16)
+            Text(controller.title(of: cell) ?? "—")
+                .lineLimit(1)
+            Spacer()
+            Text(status.title)
+                .foregroundStyle(status == .ok || status == .empty ? Color.secondary : Color.orange)
+            Menu("…") {
+                Button("Разделить по горизонтали") {
+                    controller.split(cell, axis: .horizontal)
+                }
+                Button("Разделить по вертикали") {
+                    controller.split(cell, axis: .vertical)
+                }
+                Button("Закрыть ячейку") {
+                    controller.close(cell)
+                }
+                if status == .notResponding || status == .doesNotFit {
+                    Button("Повторить") {
+                        controller.retry(cell)
+                    }
+                }
+                if controller.model.bindings[cell] != nil {
+                    Button("Убрать из ячейки") {
+                        controller.release(cell)
+                    }
+                }
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
         }
     }
 
@@ -112,15 +162,44 @@ struct MenuContent: View {
                     .foregroundStyle(.secondary)
             } else {
                 ForEach(Array(controller.windows.enumerated()), id: \.offset) { _, window in
-                    HStack(spacing: 6) {
-                        Image(nsImage: icon(for: window))
-                            .resizable()
-                            .frame(width: 16, height: 16)
-                        Text(window.displayTitle)
-                            .lineLimit(1)
+                    windowRow(window)
+                }
+            }
+        }
+    }
+
+    private func windowRow(_ window: DiscoveredWindow) -> some View {
+        let cell = controller.cell(of: window)
+        return HStack(spacing: 6) {
+            Button {
+                controller.toggleSelection(window)
+            } label: {
+                Image(systemName: controller.selected.contains(window.window) ? "checkmark.square" : "square")
+            }
+            .buttonStyle(.plain)
+            Image(nsImage: icon(for: window))
+                .resizable()
+                .frame(width: 16, height: 16)
+            Text(window.displayTitle)
+                .lineLimit(1)
+            Spacer()
+            if let cell {
+                Text(controller.model.status(of: cell).title)
+                    .foregroundStyle(.secondary)
+            }
+            if !window.isSizeSettable {
+                Image(systemName: "exclamationmark.triangle")
+                    .help("Фиксированный размер")
+            }
+            Menu("В ячейку…") {
+                ForEach(Array(controller.model.cells.enumerated()), id: \.element) { index, target in
+                    Button("Ячейка \(index + 1)") {
+                        controller.assign(window, to: target)
                     }
                 }
             }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
         }
     }
 
