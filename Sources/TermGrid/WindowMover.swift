@@ -14,6 +14,7 @@ enum ApplyReason: String {
     case drag
     case fit
     case apply
+    case edge
 }
 
 struct ApplyResult {

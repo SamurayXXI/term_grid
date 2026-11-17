@@ -36,14 +36,21 @@ public struct DividerDrag: Sendable {
 }
 
 extension Divider {
-    public static let minThickness: CGFloat = 1
+    public static let minThickness: CGFloat = 6
+    public static let minLength: CGFloat = 1
 
     public var isGrabbable: Bool {
-        min(rect.width, rect.height) >= Self.minThickness
+        (axis == .horizontal ? rect.height : rect.width) >= Self.minLength
+    }
+
+    public var hitRect: CGRect {
+        let thickness = axis == .horizontal ? rect.width : rect.height
+        let grow = max(0, Self.minThickness - thickness) / 2
+        return axis == .horizontal ? rect.insetBy(dx: -grow, dy: 0) : rect.insetBy(dx: 0, dy: -grow)
     }
 
     public func panelFrame(primaryHeight: CGFloat) -> CGRect {
-        ScreenSpace.fromAX(rect, primaryHeight: primaryHeight)
+        ScreenSpace.fromAX(hitRect, primaryHeight: primaryHeight)
     }
 
     public func point(along fraction: CGFloat) -> CGPoint {

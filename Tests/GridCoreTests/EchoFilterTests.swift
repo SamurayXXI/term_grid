@@ -95,4 +95,37 @@ import Testing
         filter.markSettled(window)
         #expect(!filter.isPending(window))
     }
+
+    @Test func externalChangeInsideSettleWindowIsRecheckedNotDropped() {
+        var filter = EchoFilter<Int>()
+        filter.markPending(window)
+        filter.markCompleted(window, actual: actual, at: 10)
+        #expect(filter.decide(window, current: shifted(100), at: 10.03) == .recheck(at: 10.25))
+        #expect(filter.decide(window, current: shifted(100), at: 10.3) == .external)
+    }
+
+    @Test func decideTreatsLastActualMatchAsEchoEvenInsideSettleWindow() {
+        var filter = EchoFilter<Int>()
+        filter.markCompleted(window, actual: actual, at: 10)
+        #expect(filter.decide(window, current: shifted(1), at: 10.01) == .echo)
+    }
+
+    @Test func decideWhilePendingWaitsForWrites() {
+        var filter = EchoFilter<Int>()
+        filter.markPending(window)
+        #expect(filter.decide(window, current: shifted(100), at: 0) == .afterWrites)
+    }
+
+    @Test func decideAfterTimeoutRecovers() {
+        var filter = EchoFilter<Int>()
+        filter.markPending(window)
+        filter.markTimedOut(window)
+        #expect(filter.decide(window, current: shifted(30), at: 5) == .recovered)
+        #expect(filter.decide(window, current: shifted(30), at: 5) != .echo)
+    }
+
+    @Test func decideOnUnknownWindowIsExternal() {
+        let filter = EchoFilter<Int>()
+        #expect(filter.decide(window, current: actual, at: 0) == .external)
+    }
 }

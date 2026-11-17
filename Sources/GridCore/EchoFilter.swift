@@ -7,6 +7,14 @@ public enum EchoClassification: Equatable, Sendable {
     case recovered
 }
 
+public enum EchoDecision: Equatable, Sendable {
+    case echo
+    case external
+    case recovered
+    case afterWrites
+    case recheck(at: TimeInterval)
+}
+
 public struct EchoFilter<Window: Hashable & Sendable>: Sendable {
     public static var settleInterval: TimeInterval { 0.25 }
     public static var tolerance: CGFloat { 2 }
@@ -50,6 +58,16 @@ public struct EchoFilter<Window: Hashable & Sendable>: Sendable {
 
     public func isPending(_ window: Window) -> Bool {
         (states[window]?.writes ?? 0) > 0
+    }
+
+    public func decide(_ window: Window, current: CGRect, at time: TimeInterval) -> EchoDecision {
+        guard let state = states[window] else { return .external }
+        if state.writes > 0 { return .afterWrites }
+        if let last = state.lastActual, Self.matches(last, current) { return .echo }
+        if let completedAt = state.completedAt, time - completedAt < Self.settleInterval {
+            return .recheck(at: completedAt + Self.settleInterval)
+        }
+        return state.timedOut ? .recovered : .external
     }
 
     public func classify(_ window: Window, current: CGRect, at time: TimeInterval) -> EchoClassification {

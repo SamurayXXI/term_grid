@@ -47,7 +47,8 @@ extension CellStatus {
 @MainActor
 final class GridController: ObservableObject {
     static let shared = GridController(store: GridController.launchStore())
-    static let gapChoices: [Int] = [4, 8, 12, 16]
+    static let gapChoices: [Int] = [0, 1, 2, 3, 4, 6, 8]
+    private static let edgeQuietInterval: TimeInterval = 0.3
     static let terminalBundleIds: Set<String> = ["com.apple.Terminal", "com.googlecode.iterm2"]
     private static let minCell = CGSize(width: 120, height: 80)
 
@@ -77,6 +78,17 @@ final class GridController: ObservableObject {
         var lastPoint: CGPoint
     }
 
+    private struct EdgeSession {
+        let cell: CellID
+        let window: AXWindow
+        let reference: CGRect
+        let startTree: LayoutNode
+        let startFrames: [CellID: CGRect]
+        let operation: Operation
+        var moves: [EdgeMove] = []
+        var tick = 0
+    }
+
     let presets = LayoutPreset.allCases
 
     @Published private(set) var screens: [ScreenOption] = ScreenOption.current()
@@ -91,7 +103,7 @@ final class GridController: ObservableObject {
     @Published private(set) var selected: Set<AXWindow> = []
     @Published var preset: LayoutPreset = .twoColumns
     @Published var screenID: CGDirectDisplayID? = ScreenOption.current().first?.id
-    @Published var gap: Int = 8
+    @Published var gap: Int = LayoutSnapshot.defaultGap
     @Published private(set) var dividersHidden = false
     private(set) var shownDividers: [Divider] = []
 
@@ -109,6 +121,9 @@ final class GridController: ObservableObject {
         managesWindows: { [unowned self] pid in self.model.bindings.values.contains { $0.pid == pid } }
     ))
     private var activeDrag: ActiveDrag?
+    private var edgeSession: EdgeSession?
+    private var notifiedKinds: [AXWindow: AXEventKind] = [:]
+    private var recheckAfterWrites = Set<AXWindow>()
     private lazy var monitor = AXEventMonitor(mover: mover) { [unowned self] event in
         self.handle(event)
     }
@@ -338,6 +353,7 @@ final class GridController: ObservableObject {
     func reset() {
         gridLogger.notice("command reset")
         cancelDrag()
+        cancelEdgeResize()
         model.reset()
         pendingBindings = []
         invalidateRestore()
@@ -349,6 +365,10 @@ final class GridController: ObservableObject {
 
     func beginDrag(_ id: DividerID, at point: CGPoint) -> Bool {
         cancelDrag()
+        guard edgeSession == nil else {
+            gridLogger.notice("drag refused divider=\(Self.describe(id), privacy: .public) reason=edgeResize")
+            return false
+        }
         guard !gridRect.isEmpty else { return false }
         cellFrames = solve(model.tree, in: gridRect)
         guard let plan = DividerDrag(tree: model.tree, divider: id, frames: cellFrames, gap: CGFloat(gap), origin: point) else {
@@ -558,6 +578,7 @@ final class GridController: ObservableObject {
         onFinished: (() -> Void)? = nil
     ) {
         cancelDrag()
+        cancelEdgeResize()
         guard let grid = gridRectInAX() else {
             logApply("apply skipped no screen")
             gridRect = .zero
@@ -603,10 +624,7 @@ final class GridController: ObservableObject {
         guard let frame = cellFrames[cell] else { return }
         let generation = model.nextGeneration(for: window)
         operation.outstanding += 1
-        if !operation.pids.contains(window.pid) {
-            operation.pids.insert(window.pid)
-            mover.beginOperation([window.pid])
-        }
+        include(window.pid, in: operation)
         prepareWrite(window)
         mover.request(
             window,
@@ -765,6 +783,12 @@ final class GridController: ObservableObject {
         refreshDividers()
     }
 
+    private func include(_ pid: pid_t, in operation: Operation) {
+        guard !operation.pids.contains(pid) else { return }
+        operation.pids.insert(pid)
+        mover.beginOperation([pid])
+    }
+
     private func prepareWrite(_ window: AXWindow) {
         if let id = registry.id(for: window) {
             monitor.prepareWrite(window, bindingID: id)
@@ -781,6 +805,21 @@ final class GridController: ObservableObject {
         case .superseded, .invalidElement:
             echo.markSettled(result.window)
         }
+        let window = result.window
+        if !echo.isPending(window), recheckAfterWrites.remove(window) != nil {
+            recheck(window, after: EchoFilter<AXWindow>.settleInterval)
+        }
+    }
+
+    private func recheck(_ window: AXWindow, after delay: TimeInterval) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + max(0, delay) + 0.02) { [weak self] in
+            self?.requestRead(window)
+        }
+    }
+
+    private func requestRead(_ window: AXWindow) {
+        guard model.cell(of: window) != nil, reads.request(window) else { return }
+        readFrame(window)
     }
 
     private func syncObservation() {
@@ -800,10 +839,12 @@ final class GridController: ObservableObject {
             guard let window = model.bindings.values.first(where: {
                 $0.pid == event.pid && CFEqual($0.element, event.element)
             }) else { return }
-            guard !echo.isPending(window) else { return }
-            if reads.request(window) {
-                readFrame(window)
+            notifiedKinds[window] = event.kind
+            guard !echo.isPending(window) || edgeSession?.window == window else {
+                recheckAfterWrites.insert(window)
+                return
             }
+            requestRead(window)
         case .destroyed, .miniaturized:
             guard let id = event.bindingID, let window = registry.window(for: id) else { return }
             releaseWindow(window, reason: event.kind.rawValue)
@@ -826,22 +867,138 @@ final class GridController: ObservableObject {
             logEvent("event read failed cell=\(cell.rawValue)")
             return
         }
-        switch echo.classify(window, current: current, at: Self.now()) {
+        let reference = actualFrames[cell] ?? cellFrames[cell]
+        let delta = reference.map { Self.largestDelta($0, current) } ?? 0
+        let kind = notifiedKinds[window]?.rawValue ?? "changed"
+        func log(_ verdict: String) {
+            logEvent("event \(kind) cell=\(cell.rawValue) class=\(verdict) delta=\(String(format: "%.1f", Double(delta)))")
+        }
+        if let session = edgeSession, session.window == window {
+            log("edge")
+            updateEdgeResize(current)
+            return
+        }
+        let now = Self.now()
+        switch echo.decide(window, current: current, at: now) {
         case .echo:
-            break
+            log("echo")
+        case .afterWrites:
+            log("pending")
+            recheckAfterWrites.insert(window)
+        case .recheck(let time):
+            log("deferred")
+            recheck(window, after: time - now)
         case .recovered:
+            log("recovered")
             logEvent("event recovered cell=\(cell.rawValue)")
             recover(cell, window)
         case .external:
-            guard let reference = actualFrames[cell] ?? cellFrames[cell],
-                  let change = ExternalChange.detect(reference: reference, current: current)
-            else { return }
-            model.markDetached(cell)
-            actualFrames[cell] = nil
-            logEvent("detached cell=\(cell.rawValue) reason=\(change.rawValue)")
-            saveLayout()
-            refreshDividers()
+            log("external")
+            guard let reference, let change = ExternalChange.detect(reference: reference, current: current) else { return }
+            switch change {
+            case .moved:
+                model.markDetached(cell)
+                actualFrames[cell] = nil
+                logEvent("detached cell=\(cell.rawValue) reason=\(change.rawValue)")
+                saveLayout()
+                refreshDividers()
+            case .resized:
+                beginEdgeResize(cell, window, reference: reference, current: current)
+            }
         }
+    }
+
+    private func beginEdgeResize(_ cell: CellID, _ window: AXWindow, reference: CGRect, current: CGRect) {
+        guard activeDrag == nil else {
+            logEvent("edge resize skipped cell=\(cell.rawValue) reason=drag")
+            return
+        }
+        guard !gridRect.isEmpty else { return }
+        if edgeSession != nil {
+            finishEdgeResize()
+        }
+        operationCounter += 1
+        latestOperation = operationCounter
+        let operation = Operation(id: operationCounter, pids: [], runsFit: true, onFinished: nil)
+        edgeSession = EdgeSession(
+            cell: cell,
+            window: window,
+            reference: reference,
+            startTree: model.tree,
+            startFrames: cellFrames,
+            operation: operation
+        )
+        logEvent("edge resize begin cell=\(cell.rawValue)")
+        updateEdgeResize(current)
+    }
+
+    private func updateEdgeResize(_ current: CGRect) {
+        guard var session = edgeSession else { return }
+        let grid = gridRect
+        session.moves = EdgeResize.moves(
+            of: session.cell,
+            tree: session.startTree,
+            cellFrames: session.startFrames,
+            gap: CGFloat(gap),
+            reference: session.reference,
+            current: current
+        )
+        session.tick += 1
+        edgeSession = session
+        let next = EdgeResize.tree(
+            applying: session.moves,
+            to: session.startTree,
+            cellFrames: session.startFrames,
+            minSizes: model.cellMinSizes,
+            minCell: Self.minCell,
+            solve: { solve($0, in: grid) }
+        )
+        if next != model.tree {
+            let previous = cellFrames
+            layout(next)
+            for (cell, window) in boundTargets(cells: nil, pids: nil) where cell != session.cell {
+                guard let old = previous[cell], let new = cellFrames[cell], !Self.sameRect(old, new) else { continue }
+                include(window.pid, in: session.operation)
+                submitLive(cell, window)
+            }
+        }
+        let tick = session.tick
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.edgeQuietInterval) { [weak self] in
+            guard let self, self.edgeSession?.tick == tick else { return }
+            self.finishEdgeResize()
+        }
+    }
+
+    private func finishEdgeResize() {
+        guard let session = edgeSession else { return }
+        edgeSession = nil
+        for move in session.moves {
+            let divider = move.divider.map(Self.describe) ?? "outer"
+            logEvent(
+                "edge resize cell=\(session.cell.rawValue) edge=\(move.edge.rawValue) divider=\(divider)"
+                    + " delta=\(String(format: "%.1f", Double(move.delta)))"
+            )
+        }
+        saveLayout()
+        for (cell, window) in boundTargets(cells: nil, pids: nil) {
+            let moved = session.startFrames[cell].map { old in cellFrames[cell].map { !Self.sameRect(old, $0) } ?? false } ?? true
+            guard cell == session.cell || moved else { continue }
+            submit(cell, window, session.operation, reason: .edge)
+        }
+        if session.operation.outstanding == 0 {
+            finish(session.operation)
+        }
+    }
+
+    private func cancelEdgeResize() {
+        guard let session = edgeSession else { return }
+        edgeSession = nil
+        logEvent("edge resize cancelled cell=\(session.cell.rawValue)")
+        mover.endOperation(session.operation.pids)
+    }
+
+    private nonisolated static func largestDelta(_ a: CGRect, _ b: CGRect) -> CGFloat {
+        max(abs(a.minX - b.minX), abs(a.minY - b.minY), abs(a.width - b.width), abs(a.height - b.height))
     }
 
     private func recover(_ cell: CellID, _ window: AXWindow) {
@@ -857,6 +1014,8 @@ final class GridController: ObservableObject {
         model.unbind(cell)
         actualFrames[cell] = nil
         echo.forget(window)
+        notifiedKinds[window] = nil
+        recheckAfterWrites.remove(window)
         logEvent("cell empty reason=\(reason) cell=\(cell.rawValue)")
         saveLayout()
         refreshDividers()
@@ -871,6 +1030,8 @@ final class GridController: ObservableObject {
             actualFrames[cell] = nil
             logEvent("cell empty reason=terminated cell=\(cell.rawValue)")
         }
+        notifiedKinds = notifiedKinds.filter { $0.key.pid != pid }
+        recheckAfterWrites = recheckAfterWrites.filter { $0.pid != pid }
         for window in windowInfo.keys where window.pid == pid {
             echo.forget(window)
             windowInfo[window] = nil

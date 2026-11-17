@@ -70,7 +70,7 @@ import Testing
     }
 
     @Test func gapOutOfRangeLoadsAsDefault() throws {
-        for gap in [-1, 0, 3, 17, 64] {
+        for gap in [-1, 9, 12, 16, 64] {
             var snapshot = sample()
             snapshot.gap = gap
             let decoded = try LayoutSnapshot.decode(snapshot.encoded())
@@ -80,7 +80,7 @@ import Testing
     }
 
     @Test func gapInsideRangeIsKept() throws {
-        for gap in [4, 12, 16] {
+        for gap in [0, 1, 4, 6, 8] {
             var snapshot = sample()
             snapshot.gap = gap
             #expect(try LayoutSnapshot.decode(snapshot.encoded()).gap == gap)

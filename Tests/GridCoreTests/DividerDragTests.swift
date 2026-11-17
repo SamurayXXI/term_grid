@@ -95,13 +95,38 @@ import Testing
         #expect(DividerDrag(tree: tree, divider: id, frames: frames, gap: gap, origin: CGPoint(x: CGFloat.nan, y: 0)) == nil)
     }
 
-    @Test func zeroGapDividersAreNotGrabbable() {
+    @Test func zeroGapDividersAreGrabbableWithPanelCentredOnSeam() {
         let tree = LayoutOps.preset(.grid2x2)
-        let thin = Dividers.compute(tree, frames: solve(tree, gap: 0), gap: 0)
+        let frames = solve(tree, gap: 0)
+        let thin = Dividers.compute(tree, frames: frames, gap: 0)
         #expect(!thin.isEmpty)
-        #expect(thin.allSatisfy { !$0.isGrabbable })
-        let normal = Dividers.compute(tree, frames: solve(tree, gap: 4), gap: 4)
-        #expect(normal.allSatisfy { $0.isGrabbable })
+        #expect(thin.allSatisfy { $0.isGrabbable })
+        for divider in thin {
+            let hit = divider.hitRect
+            if divider.axis == .horizontal {
+                #expect(hit.width == 6)
+                #expect(hit.midX == divider.rect.minX)
+                #expect(hit.height == divider.rect.height)
+            } else {
+                #expect(hit.height == 6)
+                #expect(hit.midY == divider.rect.minY)
+                #expect(hit.width == divider.rect.width)
+            }
+        }
+    }
+
+    @Test func hitZoneIsAtLeastSixPointsAndCentredOnTheGap() {
+        for gap in [CGFloat(1), 2, 3, 4, 6, 8] {
+            let tree = LayoutOps.preset(.twoColumns)
+            let frames = solve(tree, gap: gap)
+            let divider = Dividers.compute(tree, frames: frames, gap: gap)[0]
+            let hit = divider.hitRect
+            #expect(hit.width == max(6, gap))
+            #expect(hit.midX == divider.rect.midX)
+            let overlap = max(0, (6 - gap) / 2)
+            #expect(frames[CellID(0)]!.maxX - hit.minX == overlap)
+            #expect(hit.maxX - frames[CellID(1)]!.minX == overlap)
+        }
     }
 
     @Test func panelFrameIsDividerRectInAppKitSpace() {
@@ -112,6 +137,8 @@ import Testing
         )
         #expect(divider.panelFrame(primaryHeight: 900) == CGRect(x: 716, y: 8, width: 8, height: 859))
         #expect(ScreenSpace.toAX(divider.panelFrame(primaryHeight: 900), primaryHeight: 900) == divider.rect)
+        let thin = Divider(id: divider.id, axis: .vertical, rect: CGRect(x: 8, y: 400, width: 1000, height: 2))
+        #expect(thin.panelFrame(primaryHeight: 900) == CGRect(x: 8, y: 496, width: 1000, height: 6))
     }
 
     @Test func anchorPointLiesInsideDividerAlongItsLength() {

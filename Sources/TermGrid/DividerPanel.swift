@@ -64,7 +64,7 @@ final class DividerView: NSView {
         }
         addTrackingArea(NSTrackingArea(
             rect: .zero,
-            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            options: [.mouseEnteredAndExited, .mouseMoved, .cursorUpdate, .activeAlways, .inVisibleRect],
             owner: self,
             userInfo: nil
         ))
@@ -74,6 +74,14 @@ final class DividerView: NSView {
         guard let panel else { return }
         panel.cursor.set()
         panel.setHighlighted(true)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        panel?.cursor.set()
+    }
+
+    override func cursorUpdate(with event: NSEvent) {
+        panel?.cursor.set()
     }
 
     override func mouseExited(with event: NSEvent) {
@@ -92,6 +100,7 @@ final class DividerView: NSView {
 
     override func mouseDragged(with event: NSEvent) {
         guard let panel else { return }
+        panel.cursor.set()
         panel.overlay.dragMoved(panel.dividerID, to: Self.location(of: event))
     }
 

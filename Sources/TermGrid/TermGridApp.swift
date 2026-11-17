@@ -99,6 +99,9 @@ enum ProbeLauncher {
                         throw ProbeError(4, "selftest did not stop a process")
                     }
                     write(["type": "await-stopped"])
+                } else if command == "cursor-at" {
+                    try DispatchQueue.main.sync { try Probe.execute(request, emit: write) }
+                    write(DispatchQueue.main.sync { cursorCheck() })
                 } else if command == "shift" {
                     try Probe.execute(try resolveShift(request), emit: write)
                 } else if command == "drag", request["divider"] != nil {
@@ -135,6 +138,22 @@ enum ProbeLauncher {
             "y": Double(divider.rect.minY),
             "w": Double(divider.rect.width),
             "h": Double(divider.rect.height),
+        ]
+    }
+
+    private static func cursorCheck() -> [String: Any] {
+        let current = NSCursor.currentSystem
+        func matches(_ cursor: NSCursor) -> Bool {
+            guard let current else { return false }
+            return current.hotSpot == cursor.hotSpot && current.image.size == cursor.image.size
+        }
+        return [
+            "type": "cursor-check",
+            "available": current != nil,
+            "matchesResizeLeftRight": matches(.resizeLeftRight),
+            "matchesResizeUpDown": matches(.resizeUpDown),
+            "backgroundCursor": BackgroundCursor.isEnabled,
+            "active": NSApplication.shared.isActive,
         ]
     }
 
@@ -220,6 +239,7 @@ struct TermGridApp: App {
     init() {
         AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), AXWindow.messagingTimeout)
         TerminationSignal.install()
+        BackgroundCursor.enable()
         #if DEBUG
         ProbeLauncher.start()
         SelfTestLauncher.start()

@@ -29,8 +29,8 @@ public enum LayoutSnapshotError: Error, Equatable {
 }
 
 public struct LayoutSnapshot: Codable, Equatable, Sendable {
-    public static let gapRange = 4...16
-    public static let defaultGap = 8
+    public static let gapRange = 0...8
+    public static let defaultGap = 4
     public static let idRange = 0..<10_000
     public static let maxCells = 64
     private static let ratioTolerance = 1e-3
