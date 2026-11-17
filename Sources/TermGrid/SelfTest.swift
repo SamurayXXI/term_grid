@@ -14,6 +14,7 @@ struct SelfTestOptions {
     var stop: String?
     var discover: Bool
     var heartbeat: Bool
+    var restore: Bool
 
     var runsBody: Bool {
         move != nil || !burst.isEmpty || !arrange.isEmpty || stop != nil || discover
@@ -39,7 +40,8 @@ struct SelfTestOptions {
         stop = value("--selftest-stop")
         discover = arguments.contains("--selftest-discover")
         heartbeat = arguments.contains("--selftest-heartbeat")
-        guard runsBody || heartbeat else {
+        restore = arguments.contains("--selftest-restore")
+        guard runsBody || heartbeat || restore else {
             return nil
         }
     }
@@ -53,6 +55,11 @@ enum SelfTestLauncher {
         if options.heartbeat {
             Thread.detachNewThread {
                 beat()
+            }
+        }
+        if options.restore {
+            Thread.detachNewThread {
+                SelfTestRun(options: options).runRestore()
             }
         }
         guard options.runsBody else {
@@ -130,6 +137,18 @@ final class SelfTestRun: @unchecked Sendable {
         }
         logApply("selftest done")
         finish(0)
+    }
+
+    func runRestore() {
+        ProbeLauncher.awaitTrust(timeout: 90)
+        guard AXIsProcessTrusted() else {
+            logApply("selftest accessibility not trusted")
+            finish(2)
+        }
+        awaitMain(timeout: 30) { controller, done in
+            controller.restoreWindows(accepting: { $0.title.hasPrefix(Self.testMarker) }, onFinished: done)
+        }
+        logApply("selftest restored")
     }
 
     private func bind(_ snapshot: [DiscoveredWindow]) -> [BoundWindow] {

@@ -94,6 +94,9 @@ final class GridController: ObservableObject {
     @Published private(set) var dividersHidden = false
     private(set) var shownDividers: [Divider] = []
 
+    @Published private(set) var pendingBindings: [SavedBinding] = []
+
+    private let store: LayoutStore
     private let mover = WindowMover()
     private lazy var overlay = DividerOverlay(handlers: DividerOverlay.Handlers(
         begin: { [unowned self] id, point in self.beginDrag(id, at: point) },
@@ -118,7 +121,9 @@ final class GridController: ObservableObject {
     private var operationCounter = 0
     private var latestOperation = 0
 
-    init() {
+    init(store: LayoutStore = .standard) {
+        self.store = store
+        loadLayout()
         let workspace = NSWorkspace.shared.notificationCenter
         systemObservers.append(workspace.addObserver(
             forName: NSWorkspace.didTerminateApplicationNotification,
@@ -146,6 +151,7 @@ final class GridController: ObservableObject {
             queue: .main
         ) { [weak self] _ in
             MainActor.assumeIsolated {
+                self?.saveLayout()
                 self?.mover.restoreAllEnhancedUI(timeout: 1)
             }
         })
@@ -198,19 +204,23 @@ final class GridController: ObservableObject {
         self.preset = preset
         gridLogger.notice("command setPreset \(preset.title, privacy: .public)")
         model.applyPreset(LayoutOps.preset(preset))
+        pendingBindings = []
         actualFrames = [:]
+        saveLayout()
         apply()
     }
 
     func setScreen(_ id: CGDirectDisplayID) {
         screenID = id
         gridLogger.notice("command setScreen \(id)")
+        saveLayout()
         apply()
     }
 
     func setGap(_ gap: Int) {
         self.gap = gap
         gridLogger.notice("command setGap \(gap)")
+        saveLayout()
         apply()
     }
 
@@ -220,7 +230,9 @@ final class GridController: ObservableObject {
         for window in windows {
             windowInfo[window.window] = window
         }
+        pendingBindings = []
         actualFrames = [:]
+        saveLayout()
         apply()
     }
 
@@ -238,26 +250,32 @@ final class GridController: ObservableObject {
         for cell in affected {
             actualFrames[cell] = nil
         }
+        saveLayout()
         apply(cells: affected, onFinished: onFinished)
     }
 
     func split(_ cell: CellID, axis: Axis) {
         gridLogger.notice("command split cell=\(cell.rawValue)")
         guard model.split(cell, axis: axis) else { return }
+        saveLayout()
         apply()
     }
 
     func close(_ cell: CellID) {
         gridLogger.notice("command close cell=\(cell.rawValue)")
         guard model.close(cell) else { return }
+        pendingBindings.removeAll { $0.cellID == cell }
         actualFrames[cell] = nil
+        saveLayout()
         apply()
     }
 
     func release(_ cell: CellID) {
         gridLogger.notice("command release cell=\(cell.rawValue)")
         model.unbind(cell)
+        pendingBindings.removeAll { $0.cellID == cell }
         actualFrames[cell] = nil
+        saveLayout()
         refreshDividers()
     }
 
@@ -268,6 +286,7 @@ final class GridController: ObservableObject {
             return
         }
         actualFrames[cell] = nil
+        saveLayout()
         apply(cells: [cell])
     }
 
@@ -296,8 +315,10 @@ final class GridController: ObservableObject {
         gridLogger.notice("command reset")
         cancelDrag()
         model.reset()
+        pendingBindings = []
         selected = []
         actualFrames = [:]
+        saveLayout()
         refreshDividers()
     }
 
@@ -342,6 +363,7 @@ final class GridController: ObservableObject {
         guard let drag = activeDrag else { return }
         activeDrag = nil
         layout(drag.plan.tree(to: point, minSizes: model.cellMinSizes, minCell: Self.minCell))
+        saveLayout()
         let delta = String(format: "%.1f", Double(drag.plan.delta(to: point)))
         gridLogger.notice("drag end divider=\(Self.describe(drag.plan.divider.id), privacy: .public) delta=\(delta, privacy: .public)")
         for (cell, window) in drag.targets where model.bindings[cell] == window {
@@ -358,6 +380,94 @@ final class GridController: ObservableObject {
         overlay.dragCancelled()
         gridLogger.notice("drag cancelled divider=\(Self.describe(drag.plan.divider.id), privacy: .public)")
         mover.endOperation(drag.operation.pids)
+    }
+
+    func restoreWindows(accepting: (@Sendable (DiscoveredWindow) -> Bool)? = nil, onFinished: (() -> Void)? = nil) {
+        gridLogger.notice("command restoreWindows pending=\(self.pendingBindings.count)")
+        let pending = pendingBindings.filter { model.cells.contains($0.cellID) && model.bindings[$0.cellID] == nil }
+        guard !pending.isEmpty else {
+            onFinished?()
+            return
+        }
+        Task.detached(priority: .userInitiated) {
+            let snapshot = WindowDiscovery.snapshot()
+            await MainActor.run {
+                self.bindRestored(pending, from: snapshot, accepting: accepting, onFinished: onFinished)
+            }
+        }
+    }
+
+    private func bindRestored(
+        _ pending: [SavedBinding],
+        from snapshot: [DiscoveredWindow],
+        accepting: (@Sendable (DiscoveredWindow) -> Bool)?,
+        onFinished: (() -> Void)?
+    ) {
+        let candidates = snapshot.filter { model.cell(of: $0.window) == nil && (accepting?($0) ?? true) }
+        let matches = LayoutSnapshot.match(pending, windows: candidates.map { ($0.bundleId, $0.title) })
+        let assignments = model.cells.compactMap { cell in
+            matches[cell].map { (candidates[$0], cell) }
+        }
+        logApply("layout restore matched=\(assignments.count) pending=\(pending.count)")
+        pendingBindings = []
+        guard !assignments.isEmpty else {
+            saveLayout()
+            onFinished?()
+            return
+        }
+        assignAll(assignments, onFinished: onFinished)
+    }
+
+    private func loadLayout() {
+        switch store.load() {
+        case .missing:
+            break
+        case .corrupt:
+            gridLogger.notice("layout reset reason=corrupt")
+        case .loaded(let snapshot):
+            model = GridModel(tree: snapshot.tree)
+            if Self.gapChoices.contains(snapshot.gap) {
+                gap = snapshot.gap
+            }
+            pendingBindings = snapshot.bindings
+            if let hint = snapshot.screen, let id = screenID(matching: hint) {
+                screenID = id
+            }
+            gridLogger.notice("layout loaded cells=\(snapshot.tree.leafIDs.count) bindings=\(snapshot.bindings.count)")
+        }
+    }
+
+    private func saveLayout() {
+        let cells = Set(model.cells)
+        var bindings: [SavedBinding] = []
+        for cell in model.cells {
+            let bound = pendingBindings.first { $0.cellID == cell }
+            if let window = model.bindings[cell] ?? model.detached[cell],
+               let info = windowInfo[window],
+               let bundleId = info.bundleId {
+                bindings.append(SavedBinding(cellID: cell, bundleId: bundleId, title: info.title))
+            } else if let bound, cells.contains(bound.cellID) {
+                bindings.append(bound)
+            }
+        }
+        let current = screen(for: screenID)
+        let hint = current.map {
+            ScreenHint(name: $0.localizedName, width: Double($0.frame.width), height: Double($0.frame.height))
+        }
+        let snapshot = LayoutSnapshot(tree: model.tree, gap: gap, screen: hint, bindings: bindings)
+        do {
+            try store.save(snapshot)
+        } catch {
+            gridLogger.error("layout save failed \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    private func screenID(matching hint: ScreenHint) -> CGDirectDisplayID? {
+        let key = NSDeviceDescriptionKey("NSScreenNumber")
+        let named = NSScreen.screens.filter { $0.localizedName == hint.name }
+        let chosen = named.first { Double($0.frame.width) == hint.width && Double($0.frame.height) == hint.height }
+            ?? named.first
+        return (chosen?.deviceDescription[key] as? NSNumber).map { CGDirectDisplayID($0.uint32Value) }
     }
 
     private func screen(for id: CGDirectDisplayID?) -> NSScreen? {
