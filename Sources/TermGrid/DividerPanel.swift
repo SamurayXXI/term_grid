@@ -9,6 +9,7 @@ final class DividerPanel: NSPanel {
     let dividerID: DividerID
     private(set) var axis: Axis
     unowned let overlay: DividerOverlay
+    private var wantsHighlight = false
 
     init(divider: Divider, frame: CGRect, overlay: DividerOverlay) {
         dividerID = divider.id
@@ -46,7 +47,13 @@ final class DividerPanel: NSPanel {
     }
 
     func setHighlighted(_ highlighted: Bool) {
-        backgroundColor = NSColor.controlAccentColor.withAlphaComponent(highlighted ? Self.hoverAlpha : Self.idleAlpha)
+        wantsHighlight = highlighted
+        refreshHighlight()
+    }
+
+    func refreshHighlight() {
+        let visible = wantsHighlight && overlay.isManagedAppFrontmost
+        backgroundColor = NSColor.controlAccentColor.withAlphaComponent(visible ? Self.hoverAlpha : Self.idleAlpha)
     }
 }
 

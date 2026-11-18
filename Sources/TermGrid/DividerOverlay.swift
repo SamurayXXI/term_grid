@@ -71,6 +71,11 @@ final class DividerOverlay {
         }
     }
 
+    var isManagedAppFrontmost: Bool {
+        guard let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier else { return false }
+        return handlers.managesWindows(pid)
+    }
+
     func isDragging(_ id: DividerID) -> Bool {
         dragging == id
     }
@@ -103,6 +108,9 @@ final class DividerOverlay {
     }
 
     private func applicationActivated(_ pid: pid_t?) {
+        for panel in panels.values {
+            panel.refreshHighlight()
+        }
         guard let pid, !panels.isEmpty, handlers.managesWindows(pid) else { return }
         orderFront()
     }
