@@ -130,3 +130,32 @@ import Testing
         #expect(found[0].divider != nil)
     }
 }
+
+@Suite struct GridInsetsTests {
+    private let base = CGRect(x: 4, y: 29, width: 1504, height: 945)
+    private let minCell = CGSize(width: 120, height: 80)
+
+    @Test func outerEdgesMoveTheGridBoundary() {
+        let moves = [
+            EdgeMove(edge: .right, divider: nil, delta: -80),
+            EdgeMove(edge: .left, divider: nil, delta: 30),
+            EdgeMove(edge: .top, divider: nil, delta: 10),
+            EdgeMove(edge: .bottom, divider: nil, delta: 20),
+        ]
+        let insets = GridInsets.zero.applying(moves, in: base, minSize: minCell)
+        #expect(insets == GridInsets(left: 30, top: 10, right: 80, bottom: 0))
+        #expect(insets.inset(base) == CGRect(x: 34, y: 39, width: 1394, height: 935))
+    }
+
+    @Test func dividerMovesDoNotChangeInsets() {
+        let moves = [EdgeMove(edge: .right, divider: DividerID(container: ContainerID(1), index: 0), delta: 50)]
+        #expect(GridInsets.zero.applying(moves, in: base, minSize: minCell) == .zero)
+    }
+
+    @Test func insetsStayNonNegativeAndLeaveMinimumSize() {
+        let out = GridInsets.zero.applying([EdgeMove(edge: .left, divider: nil, delta: -40)], in: base, minSize: minCell)
+        #expect(out == .zero)
+        let huge = GridInsets.zero.applying([EdgeMove(edge: .left, divider: nil, delta: 5000)], in: base, minSize: minCell)
+        #expect(huge.inset(base).width == minCell.width)
+    }
+}

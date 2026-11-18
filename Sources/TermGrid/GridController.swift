@@ -84,6 +84,7 @@ final class GridController: ObservableObject {
         let reference: CGRect
         let startTree: LayoutNode
         let startFrames: [CellID: CGRect]
+        let startInsets: GridInsets
         let operation: Operation
         var moves: [EdgeMove] = []
         var tick = 0
@@ -122,6 +123,7 @@ final class GridController: ObservableObject {
     ))
     private var activeDrag: ActiveDrag?
     private var edgeSession: EdgeSession?
+    private var insets = GridInsets.zero
     private var notifiedKinds: [AXWindow: AXEventKind] = [:]
     private var recheckAfterWrites = Set<AXWindow>()
     private lazy var monitor = AXEventMonitor(mover: mover) { [unowned self] event in
@@ -249,6 +251,7 @@ final class GridController: ObservableObject {
 
     func setScreen(_ id: CGDirectDisplayID) {
         screenID = id
+        insets = .zero
         gridLogger.notice("command setScreen \(id)")
         saveLayout()
         apply()
@@ -512,6 +515,7 @@ final class GridController: ObservableObject {
             if Self.gapChoices.contains(snapshot.gap) {
                 gap = snapshot.gap
             }
+            insets = snapshot.insets ?? .zero
             pendingBindings = snapshot.bindings
             if let hint = snapshot.screen, let id = screenID(matching: hint) {
                 screenID = id
@@ -537,7 +541,7 @@ final class GridController: ObservableObject {
         let hint = current.map {
             ScreenHint(name: $0.localizedName, width: Double($0.frame.width), height: Double($0.frame.height))
         }
-        let snapshot = LayoutSnapshot(tree: model.tree, gap: gap, screen: hint, bindings: bindings)
+        let snapshot = LayoutSnapshot(tree: model.tree, gap: gap, screen: hint, bindings: bindings, insets: insets == .zero ? nil : insets)
         do {
             try store.save(snapshot)
         } catch {
@@ -560,11 +564,15 @@ final class GridController: ObservableObject {
         } ?? NSScreen.main
     }
 
-    private func gridRectInAX() -> CGRect? {
+    private func baseGridRectInAX() -> CGRect? {
         guard let screen = screen(for: screenID), let primary = NSScreen.screens.first else { return nil }
         let inset = CGFloat(gap)
         let area = screen.visibleFrame.insetBy(dx: inset, dy: inset)
         return ScreenSpace.toAX(area, primaryHeight: primary.frame.height)
+    }
+
+    private func gridRectInAX() -> CGRect? {
+        baseGridRectInAX().map { insets.inset($0) }
     }
 
     private func solve(_ tree: LayoutNode, in grid: CGRect) -> [CellID: CGRect] {
@@ -926,6 +934,7 @@ final class GridController: ObservableObject {
             reference: reference,
             startTree: model.tree,
             startFrames: cellFrames,
+            startInsets: insets,
             operation: operation
         )
         logEvent("edge resize begin cell=\(cell.rawValue)")
@@ -934,7 +943,7 @@ final class GridController: ObservableObject {
 
     private func updateEdgeResize(_ current: CGRect) {
         guard var session = edgeSession else { return }
-        let grid = gridRect
+        guard let base = baseGridRectInAX() else { return }
         session.moves = EdgeResize.moves(
             of: session.cell,
             tree: session.startTree,
@@ -945,16 +954,27 @@ final class GridController: ObservableObject {
         )
         session.tick += 1
         edgeSession = session
+        let nextInsets = session.startInsets.applying(session.moves, in: base, minSize: Self.minCell)
+        let grid = nextInsets.inset(base)
+        let anchored = GridRetarget.tree(
+            session.startTree,
+            startFrames: session.startFrames,
+            from: session.startInsets.inset(base),
+            to: grid,
+            gap: CGFloat(gap)
+        )
         let next = EdgeResize.tree(
             applying: session.moves,
-            to: session.startTree,
-            cellFrames: session.startFrames,
+            to: anchored,
+            cellFrames: solve(anchored, in: grid),
             minSizes: model.cellMinSizes,
             minCell: Self.minCell,
             solve: { solve($0, in: grid) }
         )
-        if next != model.tree {
+        if next != model.tree || nextInsets != insets {
             let previous = cellFrames
+            insets = nextInsets
+            gridRect = grid
             layout(next)
             for (cell, window) in boundTargets(cells: nil, pids: nil) where cell != session.cell {
                 guard let old = previous[cell], let new = cellFrames[cell], !Self.sameRect(old, new) else { continue }

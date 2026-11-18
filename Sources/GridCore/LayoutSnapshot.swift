@@ -37,12 +37,14 @@ public struct LayoutSnapshot: Codable, Equatable, Sendable {
 
     public var tree: LayoutNode
     public var gap: Int
+    public var insets: GridInsets?
     public var screen: ScreenHint?
     public var bindings: [SavedBinding]
 
-    public init(tree: LayoutNode, gap: Int, screen: ScreenHint?, bindings: [SavedBinding]) {
+    public init(tree: LayoutNode, gap: Int, screen: ScreenHint?, bindings: [SavedBinding], insets: GridInsets? = nil) {
         self.tree = tree
         self.gap = gap
+        self.insets = insets
         self.screen = screen
         self.bindings = bindings
     }
