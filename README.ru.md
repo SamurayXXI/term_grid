@@ -65,7 +65,7 @@ scripts/test.sh --filter DividerTests
 
 Версия задаётся в `CFBundleShortVersionString` в `Resources/Info.plist`, и менять её нужно только там. Каждый релиз помечается тегом `v<версия>` и публикуется на GitHub вместе с DMG `TermGrid-<версия>.dmg`.
 
-Чтобы опубликовать: поднимите версию в `Resources/Info.plist`, закоммитьте и запушьте `main`. Затем с чистого `main`, совпадающего с `origin/main`, запустите:
+Чтобы опубликовать: поднимите версию в `Resources/Info.plist`, переименуйте `[Unreleased]` в `CHANGELOG.md` в новую версию с датой, закоммитьте оба файла и запушьте `main`. Затем с чистого `main`, совпадающего с `origin/main`, запустите:
 
 ```bash
 scripts/release.sh             # пробный запуск: проверки и сборка DMG, ничего не публикует

@@ -65,7 +65,7 @@ The local workflow does not run the full suite without `--filter`. Run the suite
 
 The version is `CFBundleShortVersionString` in `Resources/Info.plist`. It is the only place to change it. Each release is tagged `v<version>` and published on GitHub with the DMG `TermGrid-<version>.dmg`.
 
-To publish: bump the version in `Resources/Info.plist`, commit it, and push `main`. Then run from a clean `main` that equals `origin/main`:
+To publish: bump the version in `Resources/Info.plist`, rename `[Unreleased]` in `CHANGELOG.md` to the new version with its date, commit both, and push `main`. Then run from a clean `main` that equals `origin/main`:
 
 ```bash
 scripts/release.sh             # dry run: checks and builds the DMG, publishes nothing
