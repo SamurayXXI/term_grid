@@ -6,6 +6,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-18
+
 ### Added
 
 - Menu-bar app that tiles windows into a grid with presets: two columns, three columns, two rows, 2x2, one plus two, 2x3.
