@@ -1,131 +1,173 @@
 # TermGrid
 
-## Что это
+Russian version: [README.ru.md](README.ru.md)
 
-TermGrid — приложение для macOS в строке меню. Оно раскладывает окна любых приложений (терминалы, браузер, редактор) по сетке. Между ячейками лежат разделители: их тянут мышью, и окна по обе стороны меняют размер сразу во время движения.
+TermGrid is a macOS menu-bar app that tiles windows of any applications, terminals first, into a grid and lets you resize cells by dragging dividers or window edges with the mouse instead of hotkeys.
 
-TermGrid двигает чужие окна через Accessibility API. Свой терминал или редактор он не встраивает.
+## Status
 
-## Требования
+TermGrid is an early MVP.
 
-- macOS 14 или новее.
-- Command Line Tools для Xcode. Полный Xcode не нужен: сборка идёт через `swift build`.
+- Requires macOS 14 or later.
+- Built and tested with Command Line Tools only. There is no Xcode project.
+- Verified live only on TermGrid's own test windows and in one maintainer session. Terminal.app character-step fitting has not been measured.
 
-Проверить установку Command Line Tools:
+## Features
+
+- Grid presets (two columns, three columns, two rows, 2x2, one plus two, 2x3) on one screen.
+- Assign windows to cells from the menu, or use "Lay out automatically".
+- Drag a divider to resize the two neighbouring cells live, while the mouse moves.
+- Resize a window by its inner edge: the adjacent divider moves and the neighbouring window takes the freed space. An outer edge of the grid snaps the window back to its cell size.
+- Gap between windows: 0, 1, 2, 3, 4, 6 or 8 pt, default 4 pt. Dividers are at least 6 pt thick and centred on the gap.
+- Character-cell fitting for Terminal.app and iTerm2 is on by design. It closes inner gaps between neighbouring terminal windows when the shortfall is under 40 pt.
+- The layout is saved automatically and can be restored with the "Restore windows" menu button.
+- The menu shows a warning while Stage Manager is on.
+
+## Requirements
+
+- macOS 14 or later.
+- Command Line Tools for Xcode. Full Xcode is not needed: the build uses `swift build`.
+
+Check the installation:
 
 ```bash
 xcode-select -p
 ```
 
-Если команда ничего не выводит или возвращает ошибку, установите их: `xcode-select --install`.
+If the command prints nothing or fails, install the tools with `xcode-select --install`.
 
-Выключите Стейдж-менеджер (Stage Manager): Системные настройки → Рабочий стол и Dock → Стейдж-менеджер. Пока он включён, macOS группирует окна по приложениям, переключает только между группами и переносит часть окон в боковую полосу. TermGrid не видит окна в этой полосе, поэтому раскладка ломается: окна могут сворачиваться или пропадать, а новые ячейки выглядят пустыми. Пока Стейдж-менеджер включён, меню TermGrid показывает предупреждение. Причину указал пользователь, и она согласуется с настройкой на этой машине (`defaults read com.apple.WindowManager GloballyEnabled` выводит `1`). Повторная проверка с выключенным Стейдж-менеджером ещё не выполнена.
+Turn Stage Manager off (see [Stage Manager](#stage-manager)).
 
-## Сборка
+## Build
 
-Из корня репозитория:
+Run from the repository root:
 
 ```bash
-scripts/build-app.sh            # debug, по умолчанию
+scripts/build-app.sh            # debug, default
 scripts/build-app.sh release    # release
 ```
 
-Скрипт собирает продукт `TermGrid`, кладёт бинарь и `Resources/Info.plist` в `build/TermGrid.app` и подписывает приложение. Последней строкой он печатает путь к `build/TermGrid.app`.
+The script builds the `TermGrid` product, copies the binary and `Resources/Info.plist` into `build/TermGrid.app`, and signs the bundle. The last line it prints is the path to `build/TermGrid.app`.
 
-## Тесты
+## Tests
 
 ```bash
 scripts/test.sh --filter DividerTests
 ```
 
-Аргумент `--filter` принимает имя suite из `Tests/GridCoreTests`. Имя берётся из объявления `struct`, а не из имени файла: suite `DividerTests` объявлен в файле `DividersTests.swift`. Все аргументы скрипт передаёт в `swift test`.
+`--filter` takes the name of a test suite from `Tests/GridCoreTests`. Use the name from the `struct` declaration, not the file name: the suite `DividerTests` is declared in `DividersTests.swift`. The script passes all arguments to `swift test`.
 
-Скрипт нужен, потому что под одними Command Line Tools `swift test` со Swift Testing не работает (`no such module 'Testing'`). Скрипт добавляет флаги `-F` и `-rpath`, которые указывают на каталог фреймворков CLT. Вызывать `swift test` напрямую не нужно.
+The script is needed because with only Command Line Tools, `swift test` cannot load Swift Testing (`no such module 'Testing'`). The script adds the `-F` and `-rpath` flags that point at the CLT framework directory. Do not call `swift test` directly.
 
-Полный прогон без `--filter` в локальном workflow не используется. Проверяйте suite, которые затрагивает ваше изменение.
+The local workflow does not run the full suite without `--filter`. Run the suites that your change touches.
 
-## Запуск
+## Run
 
 ```bash
 open build/TermGrid.app
 ```
 
-Запускайте приложение только через `open`. Бинарь `build/TermGrid.app/Contents/MacOS/TermGrid` из терминала не запускайте: право Accessibility проверяется у процесса, который запустил бинарь. Тогда право нужно выдавать терминалу, а не TermGrid.
+Launch the app only with `open`. Do not run the binary `build/TermGrid.app/Contents/MacOS/TermGrid` directly from a terminal: the Accessibility permission is checked for the process that started the binary, so the permission would have to be granted to the terminal instead of TermGrid.
 
-Иконка появляется в строке меню. В Dock иконки нет (`LSUIElement`).
+The app appears in the menu bar. It has no Dock icon (`LSUIElement`).
 
-## Разрешения
+## Permissions
 
-TermGrid использует одно разрешение: **Универсальный доступ (Accessibility)**. Запись экрана (Screen Recording) не нужна: приложение не показывает содержимое окон.
+TermGrid uses one permission: **Accessibility**. It does not need Screen Recording, because it never shows window contents.
 
-1. Запустите `open build/TermGrid.app`.
-2. macOS покажет системный диалог. Он только открывает Системные настройки. Включить переключатель в самом диалоге нельзя.
-3. В Системных настройках откройте «Конфиденциальность и безопасность» → «Универсальный доступ» и включите TermGrid.
-4. Если меню продолжает показывать онбординг после выдачи права, завершите TermGrid и запустите его снова через `open build/TermGrid.app`. В одном прогоне запущенный TermGrid не заметил право, выданное после старта, и записал «accessibility trusted» только после перезапуска.
+1. Run `open build/TermGrid.app`.
+2. macOS shows a system dialog. It only opens System Settings. You cannot switch the toggle inside the dialog.
+3. In System Settings, open Privacy & Security → Accessibility and enable TermGrid.
+4. If the menu still shows onboarding after you grant the permission, quit TermGrid and start it again with `open build/TermGrid.app`. In one test run, a running TermGrid did not notice a permission granted after it started, and logged "accessibility trusted" only after a restart.
 
-Право теряется после каждой пересборки. Наиболее вероятная причина (не подтверждена): при ad-hoc подписи право привязано к хешу кода. Пересборка во время работающего экземпляра или переключение строки в Системных настройках, созданной другой сборкой, привязывает право к хешу, которого нет у запущенного процесса. После любой пересборки:
+The permission is lost after every rebuild. The most likely cause, not confirmed: with an ad-hoc signature, the permission is bound to the code hash. A rebuild while an instance is running, or toggling a Settings row left by another build, binds the permission to a hash that the running process does not have. After any rebuild:
 
-1. Завершите TermGrid.
-2. Сбросьте право: `tccutil reset Accessibility local.termgrid.TermGrid` (см. «Подпись»).
-3. Запустите `open build/TermGrid.app` и выдайте право заново.
+1. Quit TermGrid.
+2. Reset the permission: `tccutil reset Accessibility local.termgrid.TermGrid` (see [Signing](#signing)).
+3. Run `open build/TermGrid.app` and grant the permission again.
 
-Пока право не выдано, меню показывает кнопку «Открыть настройки».
+While the permission is not granted, the menu shows an "Open Settings" button.
 
-## Подпись
+## Signing
 
-Скрипт сейчас подписывает приложение ad-hoc (`codesign --force --sign -`). Право Accessibility привязано к подписи. При ad-hoc каждая пересборка получает новую подпись. Выданное право после этого перестаёт работать, хотя переключатель в Системных настройках остаётся включённым.
+The build script currently signs the app ad-hoc (`codesign --force --sign -`). The Accessibility permission is bound to the signature. With an ad-hoc signature, each rebuild gets a new signature, so a granted permission stops working even though the toggle in System Settings stays on.
 
-План предпочитает стабильный self-signed сертификат, но `scripts/build-app.sh` его пока не использует и выбирает только ad-hoc. Путь с self-signed сертификатом на этой машине не проверен: сертификата нет.
+The plan prefers a stable self-signed certificate, but `scripts/build-app.sh` does not use one yet and only signs ad-hoc. The self-signed path has not been verified: there is no certificate on the development machine.
 
-Пока сборка ad-hoc, после каждой пересборки сбрасывайте право и выдавайте его заново:
+While the build is ad-hoc, reset the permission after every rebuild and grant it again:
 
 ```bash
 tccutil reset Accessibility local.termgrid.TermGrid
 ```
 
-Затем запустите `open build/TermGrid.app` и выдайте право по шагам из раздела «Разрешения».
+Then run `open build/TermGrid.app` and grant the permission as described in [Permissions](#permissions).
 
-## Терминалы
+## Stage Manager
 
-Terminal.app и iTerm2 принимают размер только в целых символах. Окно может оказаться на один символ меньше запрошенного размера ячейки.
+Turn Stage Manager off before you use TermGrid: System Settings → Desktop & Dock → Stage Manager.
 
-Подгонка под шаг символов включена по умолчанию (план, Д-14). Она закрывает внутренние щели между соседними окнами Terminal.app и iTerm2, если недостаток меньше 40 pt. Остаточная щель остаётся только у внешнего края сетки и рядом с окнами других приложений. Это проектное поведение по плану: на Terminal.app оно не измерялось.
+While Stage Manager is on, macOS groups windows by application, lets you switch only between groups, and moves some windows into the side strip. TermGrid does not see windows in the side strip, so the layout breaks: windows can be minimised or disappear, and new cells look empty. The menu shows a warning while Stage Manager is on.
 
-Чтобы убрать ступенчатый шаг в iTerm2:
+The project maintainer attributes this to Stage Manager. It matches the setting on the development machine: `defaults read com.apple.WindowManager GloballyEnabled` prints `1`. A re-test with Stage Manager off has not been done yet.
 
-1. Откройте Settings → Advanced.
-2. Включите параметр «Terminal windows resize smoothly».
+## Usage
 
-Название и расположение параметра зависят от версии iTerm2: сверьте их в своей версии. В одном замере (`docs/spike-results.md`, раздел c) окна iTerm2 с этим параметром приняли запрошенный размер точно. Профиль и шрифт этого замера не записаны, поэтому результат не проверен и не считается подтверждённым.
+The menu labels are in Russian. The English names below are translations.
 
-## Ресайз мышью
+- **Grid** (Сетка): choose a preset, the screen, and the gap, or hide the dividers. "Lay out automatically" arranges the windows you selected in the window list; it is enabled only when some are selected. "Reset" clears the grid. "Restore windows" restores the saved layout.
+- **Cells** (Ячейки): for each cell, split it horizontally or vertically, close it, return a detached window to the grid, retry, or remove the window from the cell.
+- **Windows** (Окна): assign a window to a cell.
 
-- Зазор между окнами выбирается в меню «Сетка»: 0, 1, 2, 3, 4, 6 или 8 pt, по умолчанию 4 pt. Значения больше 8 pt пользователь счёл бессмысленными, поэтому выбор ограничен малыми значениями.
-- Панель разделителя занимает не меньше 6 pt и центрирована на зазоре. При зазоре меньше 6 pt панель заходит на края соседних окон.
-- Перетаскивание разделителя меняет размер обеих соседних ячеек.
-- Ресайз за край окна внутри сетки:
-  - внутренний край двигает соседний разделитель, соседнее окно занимает освободившееся место; пустых мест и открепления нет;
-  - внешний край сетки возвращает окно к размеру ячейки;
-  - угол меняет каждую ось отдельно.
-- Простое перемещение окна (без ресайза) открепляет его от ячейки.
-- Курсор ресайза над разделителем виден, даже когда TermGrid не активное приложение. Для этого используется приватное свойство CoreGraphics `SetsCursorInBackground`: оно подключается через `dlsym` во время работы (`Sources/TermGrid/BackgroundCursor.swift`). Приватный API может исчезнуть в новой версии macOS. Тогда курсор не меняется, а разделитель остаётся подсвеченным при наведении.
-- Вид курсора подтвердил пользователь на глаз. Автоматическая проверка `tgprobe` (`.omc/evidence/final/out-cursor.ndjson`) показала `matchesResizeLeftRight=false`, поэтому она не подтверждает вид курсора.
-- Проверено на тестовых окнах `tgprobe`: внутренний край правого окна +100 pt дал левому окну 744 → 844 pt, а правому 744 → 644 pt. Перетаскивание на 900 pt упёрлось в минимум соседнего окна 120 pt.
+Drag a divider with the mouse to resize the two cells on each side. Drag an inner window edge to move the adjacent divider. Drag an outer grid edge to snap the window back to its cell. Moving a window yourself detaches it from its cell; use "Return to grid" to attach it again.
 
-## Ограничения
+The resize cursor appears over a divider even when TermGrid is not the active app. See [Limitations and known issues](#limitations-and-known-issues) for how this works.
 
-- Окна на других Spaces не видны Accessibility. TermGrid их не раскладывает и не переносит между Spaces.
-- Полноэкранные окна пропускаются и не попадают в список окон.
-- Сетка одна и находится на одном экране. Несколько мониторов в MVP не поддерживаются.
-- Перемещение окна мышью открепляет его от ячейки. Вернуть окно в сетку можно из меню: «Вернуть в сетку».
-- Окна, у которых минимальный размер больше ячейки, перекрывают соседние ячейки: при раскладке солвер не учитывает минимальные размеры. В логе такие окна имеют статус `clamped`. Не проверено на реальных приложениях.
-- Не проверено: после «Разложить автоматически» с несколькими реальными окнами новая ячейка может выглядеть пустой. Причина не подтверждена.
-- Не проверено: смена конфигурации мониторов может открепить окна до повторного apply. Для проверки нужен второй монитор.
-- Не проверено: живой прогон приложения, остановленного SIGSTOP (с heartbeat главного потока), и окон Chromium и Electron.
-- Панели-разделители работают на уровне `.floating`. Поверх неуправляемых окон они могут перехватывать клики в полосе зазора.
-- Замеры скорости живого ресайза сняты на собственных окнах и на iTerm2. Terminal.app и браузеры не измерялись (`docs/spike-results.md`, раздел b).
+## Limitations and known issues
 
-## Документация
+- Windows on other Spaces are not visible to Accessibility. TermGrid does not lay them out or move them between Spaces. Whether the divider panels follow Spaces has not been verified.
+- Full-screen windows are skipped and do not appear in the window list.
+- One grid on one screen. Multiple monitors are not supported in the MVP.
+- Moving a window with the mouse detaches it from its cell.
+- Stage Manager must be off. See [Stage Manager](#stage-manager).
+- A window whose minimum size is larger than its cell is clamped (log status `clamped`) and overlaps neighbouring cells, because the layout solver does not use minimum sizes when it lays out cells. Not verified on real applications.
+- Not verified: after "Lay out automatically" with several real windows, a new cell can look empty. The project maintainer attributes this to Stage Manager; a re-test with it off has not been done.
+- Not verified: a monitor change may detach windows before the layout is re-applied. Checking this needs a second display.
+- Not verified: live runs of an application stopped with SIGSTOP (with the main-thread heartbeat), and of Chromium and Electron windows.
+- Divider panels are at the `.floating` window level. Over unmanaged windows they can catch clicks in the gap strip.
+- The resize cursor uses the private CoreGraphics connection property `SetsCursorInBackground`. The app resolves it with `dlsym` at runtime (`Sources/TermGrid/BackgroundCursor.swift`). Private APIs can disappear or change in a future macOS. If the symbol is missing, the cursor stays the system cursor, and the divider is highlighted on hover instead.
+- The project maintainer confirmed the resize cursor by eye. The automated `tgprobe` cursor check reported `matchesResizeLeftRight=false`, so it does not confirm the cursor.
+- Live-resize latency was measured on TermGrid's own test windows and on iTerm2. Terminal.app and browsers were not measured (`docs/spike-results.md`, section b).
+- The iTerm2 "Terminal windows resize smoothly" observation comes from one measurement without a recorded profile or font (`docs/spike-results.md`, section c). Check the setting in your iTerm2 version.
 
-- `docs/plans/window-grid.md` — план реализации, допущения (Д-0…Д-15) и риски (R-1…R-16).
-- `docs/spike-results.md` — результаты замеров, на которых основаны решения о подписи, частоте ресайза и разделителях.
+## Project layout
+
+- `Sources/GridCore`: pure layout logic (layout tree, frame solver, dividers, edge resize, echo filter, fit policy, layout snapshot). It imports only CoreGraphics and Foundation.
+- `Sources/TermGrid`: the menu-bar app (window discovery and moving through Accessibility, divider panels, grid controller, menu).
+- `Sources/ProbeKit`: Accessibility probes shared by the app and `tgprobe`. Debugging tool.
+- `Sources/tgprobe`: command-line probe utility for checks that need Accessibility. It runs through the app bundle.
+- `Tests/GridCoreTests`: Swift Testing suites for `GridCore`.
+- `Resources/Info.plist`: bundle metadata.
+- `scripts/`: build, tests, the no-comments check, and debugging helpers (`probe.sh`, `selftest.sh`; they need a debug build of `build/TermGrid.app`).
+- `docs/`: the implementation plan (`docs/plans/window-grid.md`) and spike results (`docs/spike-results.md`), in Russian.
+
+## Contributing
+
+- Do not add comments to code. This is a project rule. Put rationale in the commit message or in `docs/`. Check it with:
+
+  ```bash
+  scripts/check-no-comments.sh
+  ```
+
+  The script prints the lines that break the rule and exits with status 1.
+- Run only the tests for the suites your change touches:
+
+  ```bash
+  scripts/test.sh --filter DividerTests
+  ```
+
+- Build the app before you check it by hand: `scripts/build-app.sh`.
+- Use conventional commit messages, as in the existing history (for example `feat(grid): ...`, `docs: ...`).
+
+## License
+
+TermGrid is licensed under the Apache License 2.0. See [LICENSE](LICENSE).
