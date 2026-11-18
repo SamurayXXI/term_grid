@@ -61,6 +61,19 @@ The script is needed because with only Command Line Tools, `swift test` cannot l
 
 The local workflow does not run the full suite without `--filter`. Run the suites that your change touches.
 
+## Releases
+
+The version is `CFBundleShortVersionString` in `Resources/Info.plist`. It is the only place to change it. Each release is tagged `v<version>` and published on GitHub with the DMG `TermGrid-<version>.dmg`.
+
+To publish: bump the version in `Resources/Info.plist`, commit it, and push `main`. Then run from a clean `main` that equals `origin/main`:
+
+```bash
+scripts/release.sh             # dry run: checks and builds the DMG, publishes nothing
+scripts/release.sh --publish   # tags vX.Y.Z, pushes the tag, creates the GitHub release
+```
+
+The release is not signed or notarized. Users must right-click the app and choose Open the first time, or run `xattr -dr com.apple.quarantine /Applications/TermGrid.app`, and then grant Accessibility again.
+
 ## Run
 
 ```bash
