@@ -154,8 +154,8 @@ security import id.p12 -k ~/Library/Keychains/login.keychain-db -P tgsign -T /us
 - Панели-разделители работают на уровне `.floating`. Поверх неуправляемых окон они могут перехватывать клики в полосе зазора.
 - Курсор ресайза использует приватное свойство соединения CoreGraphics `SetsCursorInBackground`. Приложение получает его через `dlsym` во время работы (`Sources/TermGrid/BackgroundCursor.swift`). Приватные API могут исчезнуть или измениться в новой версии macOS. Если символа нет, курсор остаётся системным, а разделитель подсвечивается при наведении.
 - Вид курсора подтвердил на глаз мейнтейнер проекта. Автоматическая проверка `tgprobe` показала `matchesResizeLeftRight=false`, поэтому она не подтверждает вид курсора.
-- Скорость живого ресайза замерена на собственных окнах TermGrid и на iTerm2. Terminal.app и браузеры не измерялись (`docs/spike-results.md`, раздел b).
-- Наблюдение про настройку iTerm2 «Terminal windows resize smoothly» сделано в одном замере без записанного профиля и шрифта (`docs/spike-results.md`, раздел c). Проверьте настройку в своей версии iTerm2.
+- Скорость живого ресайза замерена на собственных окнах TermGrid и на iTerm2. Terminal.app и браузеры не измерялись.
+- Наблюдение про настройку iTerm2 «Terminal windows resize smoothly» сделано в одном замере без записанного профиля и шрифта. Проверьте настройку в своей версии iTerm2.
 
 ## Структура проекта
 
@@ -166,11 +166,10 @@ security import id.p12 -k ~/Library/Keychains/login.keychain-db -P tgsign -T /us
 - `Tests/GridCoreTests`: наборы тестов Swift Testing для `GridCore`.
 - `Resources/Info.plist`: метаданные бандла.
 - `scripts/`: сборка, тесты, проверка отсутствия комментариев и отладочные помощники (`probe.sh`, `selftest.sh`; им нужна отладочная сборка `build/TermGrid.app`).
-- `docs/`: план реализации (`docs/plans/window-grid.md`) и результаты замеров (`docs/spike-results.md`).
 
 ## Участие в разработке
 
-- Комментарии в коде не пишем. Это правило проекта. Обоснование кладите в сообщение коммита или в `docs/`. Проверка:
+- Комментарии в коде не пишем. Это правило проекта. Обоснование кладите в сообщение коммита. Проверка:
 
   ```bash
   scripts/check-no-comments.sh

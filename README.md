@@ -154,8 +154,8 @@ The resize cursor appears over a divider even when TermGrid is not the active ap
 - Divider panels are at the `.floating` window level. Over unmanaged windows they can catch clicks in the gap strip.
 - The resize cursor uses the private CoreGraphics connection property `SetsCursorInBackground`. The app resolves it with `dlsym` at runtime (`Sources/TermGrid/BackgroundCursor.swift`). Private APIs can disappear or change in a future macOS. If the symbol is missing, the cursor stays the system cursor, and the divider is highlighted on hover instead.
 - The project maintainer confirmed the resize cursor by eye. The automated `tgprobe` cursor check reported `matchesResizeLeftRight=false`, so it does not confirm the cursor.
-- Live-resize latency was measured on TermGrid's own test windows and on iTerm2. Terminal.app and browsers were not measured (`docs/spike-results.md`, section b).
-- The iTerm2 "Terminal windows resize smoothly" observation comes from one measurement without a recorded profile or font (`docs/spike-results.md`, section c). Check the setting in your iTerm2 version.
+- Live-resize latency was measured on TermGrid's own test windows and on iTerm2. Terminal.app and browsers were not measured.
+- The iTerm2 "Terminal windows resize smoothly" observation comes from one measurement without a recorded profile or font. Check the setting in your iTerm2 version.
 
 ## Project layout
 
@@ -166,11 +166,10 @@ The resize cursor appears over a divider even when TermGrid is not the active ap
 - `Tests/GridCoreTests`: Swift Testing suites for `GridCore`.
 - `Resources/Info.plist`: bundle metadata.
 - `scripts/`: build, tests, the no-comments check, and debugging helpers (`probe.sh`, `selftest.sh`; they need a debug build of `build/TermGrid.app`).
-- `docs/`: the implementation plan (`docs/plans/window-grid.md`) and spike results (`docs/spike-results.md`), in Russian.
 
 ## Contributing
 
-- Do not add comments to code. This is a project rule. Put rationale in the commit message or in `docs/`. Check it with:
+- Do not add comments to code. This is a project rule. Put rationale in the commit message. Check it with:
 
   ```bash
   scripts/check-no-comments.sh
