@@ -85,11 +85,21 @@ public struct GridModel<Window: Hashable & Sendable>: Sendable {
         var seen = Set<Window>()
         let unique = windows.filter { seen.insert($0).inserted }
         guard let newTree = LayoutOps.autoLayout(unique.count) else { return false }
+        let order = previousOrder(of: unique)
         tree = newTree
-        bindings = Dictionary(uniqueKeysWithValues: zip(newTree.leafIDs, unique))
+        bindings = Dictionary(uniqueKeysWithValues: zip(newTree.leafIDs, order))
         statuses = [:]
         detached = [:]
         return true
+    }
+
+    private func previousOrder(of windows: [Window]) -> [Window] {
+        let rank = tree.leafIDs.enumerated().reduce(into: [CellID: Int]()) { $0[$1.element] = $1.offset }
+        let position = windows.enumerated().map { index, window -> (Window, Int, Int) in
+            let cell = self.cell(of: window) ?? self.detachedCell(of: window)
+            return (window, cell.flatMap { rank[$0] } ?? Int.max, index)
+        }
+        return position.sorted { ($0.1, $0.2) < ($1.1, $1.2) }.map(\.0)
     }
 
     @discardableResult

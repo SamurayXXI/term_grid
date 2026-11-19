@@ -93,7 +93,7 @@ TermGrid uses one permission: **Accessibility**. It does not need Screen Recordi
 3. In System Settings, open Privacy & Security → Accessibility and enable TermGrid.
 4. If the menu still shows onboarding after you grant the permission, quit TermGrid and start it again with `open build/TermGrid.app`. In one test run, a running TermGrid did not notice a permission granted after it started, and logged "accessibility trusted" only after a restart.
 
-The permission is lost after every rebuild. The most likely cause, not confirmed: with an ad-hoc signature, the permission is bound to the code hash. A rebuild while an instance is running, or toggling a Settings row left by another build, binds the permission to a hash that the running process does not have. After any rebuild:
+With the `TermGrid Local Signing` certificate the permission survives rebuilds. If it is lost anyway (for example, the build fell back to ad-hoc), reset it:
 
 1. Quit TermGrid.
 2. Reset the permission: `tccutil reset Accessibility local.termgrid.TermGrid` (see [Signing](#signing)).
@@ -103,17 +103,22 @@ While the permission is not granted, the menu shows an "Open Settings" button.
 
 ## Signing
 
-The build script currently signs the app ad-hoc (`codesign --force --sign -`). The Accessibility permission is bound to the signature. With an ad-hoc signature, each rebuild gets a new signature, so a granted permission stops working even though the toggle in System Settings stays on.
+`scripts/build-app.sh` signs the app with the certificate `TermGrid Local Signing` from your login keychain. The certificate is self-signed and is not trusted by macOS, but `codesign` uses it. The Accessibility permission is then bound to the certificate, not to the binary hash, so rebuilds keep the permission.
 
-The plan prefers a stable self-signed certificate, but `scripts/build-app.sh` does not use one yet and only signs ad-hoc. The self-signed path has not been verified: there is no certificate on the development machine.
-
-While the build is ad-hoc, reset the permission after every rebuild and grant it again:
+Create the certificate once (keys stay out of the repository):
 
 ```bash
-tccutil reset Accessibility local.termgrid.TermGrid
+d="$(mktemp -d)"; cd "$d"
+openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem -days 3650 \
+  -subj "/CN=TermGrid Local Signing" \
+  -addext "extendedKeyUsage=critical,codeSigning" -addext "keyUsage=critical,digitalSignature"
+openssl pkcs12 -export -legacy -inkey key.pem -in cert.pem -out id.p12 -passout pass:tgsign
+security import id.p12 -k ~/Library/Keychains/login.keychain-db -P tgsign -T /usr/bin/codesign
 ```
 
-Then run `open build/TermGrid.app` and grant the permission as described in [Permissions](#permissions).
+If the certificate is missing, the script falls back to ad-hoc signing and prints a warning. With ad-hoc signing the permission is lost after every rebuild.
+
+The first build with the new certificate needs one new grant: run `tccutil reset Accessibility local.termgrid.TermGrid`, then `open build/TermGrid.app`, and grant the permission.
 
 ## Stage Manager
 
@@ -131,7 +136,7 @@ The menu labels are in Russian. The English names below are translations.
 - **Cells** (Ячейки): for each cell, split it horizontally or vertically, close it, return a detached window to the grid, retry, or remove the window from the cell.
 - **Windows** (Окна): assign a window to a cell.
 
-Drag a divider with the mouse to resize the two cells on each side. Drag an inner window edge to move the adjacent divider. Drag an outer grid edge to snap the window back to its cell. Moving a window yourself detaches it from its cell; use "Return to grid" to attach it again.
+Drag a divider with the mouse to resize the two cells on each side. Drag an inner window edge to move the adjacent divider. Drag an outer grid edge to snap the window back to its cell. Drag a window with the mouse onto another cell to swap it with that cell's window (the target cell is highlighted under the pointer). Released anywhere else, the window returns to its cell.
 
 The resize cursor appears over a divider even when TermGrid is not the active app. See [Limitations and known issues](#limitations-and-known-issues) for how this works.
 
@@ -140,7 +145,7 @@ The resize cursor appears over a divider even when TermGrid is not the active ap
 - Windows on other Spaces are not visible to Accessibility. TermGrid does not lay them out or move them between Spaces. Whether the divider panels follow Spaces has not been verified.
 - Full-screen windows are skipped and do not appear in the window list.
 - One grid on one screen. Multiple monitors are not supported in the MVP.
-- Moving a window with the mouse detaches it from its cell.
+- Moving a window with the mouse is a drag: it swaps or returns. A window moved without the mouse button held (for example, by another app) detaches from its cell; use "Return to grid" to attach it again.
 - Stage Manager must be off. See [Stage Manager](#stage-manager).
 - A window whose minimum size is larger than its cell is clamped (log status `clamped`) and overlaps neighbouring cells, because the layout solver does not use minimum sizes when it lays out cells. Not verified on real applications.
 - Not verified: after "Lay out automatically" with several real windows, a new cell can look empty. The project maintainer attributes this to Stage Manager; a re-test with it off has not been done.

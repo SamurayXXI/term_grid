@@ -49,6 +49,7 @@ final class GridController: ObservableObject {
     static let shared = GridController(store: GridController.launchStore())
     static let gapChoices: [Int] = [0, 1, 2, 3, 4, 6, 8]
     private static let edgeQuietInterval: TimeInterval = 0.3
+    private static let windowDragPoll: TimeInterval = 0.05
     static let terminalBundleIds: Set<String> = ["com.apple.Terminal", "com.googlecode.iterm2"]
     private static let minCell = CGSize(width: 120, height: 80)
 
@@ -90,6 +91,13 @@ final class GridController: ObservableObject {
         var tick = 0
     }
 
+    private struct WindowDragSession {
+        let window: AXWindow
+        let source: CellID
+        var target: CellID?
+        var frame: CGRect
+    }
+
     let presets = LayoutPreset.allCases
 
     @Published private(set) var screens: [ScreenOption] = ScreenOption.current()
@@ -123,6 +131,9 @@ final class GridController: ObservableObject {
     ))
     private var activeDrag: ActiveDrag?
     private var edgeSession: EdgeSession?
+    private var windowDrag: WindowDragSession?
+    private var windowDragTimer: Timer?
+    private lazy var swapHighlight = SwapHighlightPanel()
     private var insets = GridInsets.zero
     private var notifiedKinds: [AXWindow: AXEventKind] = [:]
     private var recheckAfterWrites = Set<AXWindow>()
@@ -357,6 +368,7 @@ final class GridController: ObservableObject {
         gridLogger.notice("command reset")
         cancelDrag()
         cancelEdgeResize()
+        cancelWindowDrag()
         model.reset()
         pendingBindings = []
         invalidateRestore()
@@ -905,6 +917,10 @@ final class GridController: ObservableObject {
             guard let reference, let change = ExternalChange.detect(reference: reference, current: current) else { return }
             switch change {
             case .moved:
+                if NSEvent.pressedMouseButtons & 1 != 0 {
+                    trackWindowDrag(window, cell: cell, frame: current)
+                    return
+                }
                 model.markDetached(cell)
                 actualFrames[cell] = nil
                 logEvent("detached cell=\(cell.rawValue) reason=\(change.rawValue)")
@@ -914,6 +930,87 @@ final class GridController: ObservableObject {
                 beginEdgeResize(cell, window, reference: reference, current: current)
             }
         }
+    }
+
+    private func trackWindowDrag(_ window: AXWindow, cell: CellID, frame: CGRect) {
+        if let drag = windowDrag {
+            guard drag.window == window else { return }
+        } else {
+            windowDrag = WindowDragSession(window: window, source: cell, target: nil, frame: frame)
+            windowDragTimer?.invalidate()
+            windowDragTimer = Timer.scheduledTimer(withTimeInterval: Self.windowDragPoll, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.pollWindowDrag()
+                }
+            }
+            logEvent("window drag begin cell=\(cell.rawValue)")
+        }
+        windowDrag?.frame = frame
+        updateWindowDrag()
+    }
+
+    private func updateWindowDrag() {
+        guard var drag = windowDrag else { return }
+        let target = WindowDrop.target(at: pointerLocationInAX(), frames: cellFrames, excluding: drag.source)
+        drag.target = target
+        windowDrag = drag
+        if let target, let cellFrame = cellFrames[target] {
+            swapHighlight.show(
+                cell: appKitFrame(for: cellFrame),
+                covering: appKitFrame(for: drag.frame)
+            )
+        } else {
+            swapHighlight.hide()
+        }
+    }
+
+    private func pollWindowDrag() {
+        guard windowDrag != nil else { return }
+        guard NSEvent.pressedMouseButtons & 1 != 0 else {
+            endWindowDrag()
+            return
+        }
+        updateWindowDrag()
+    }
+
+    private func endWindowDrag() {
+        guard let drag = windowDrag else { return }
+        let target = WindowDrop.target(at: pointerLocationInAX(), frames: cellFrames, excluding: drag.source)
+        cancelWindowDrag()
+        windowDragEnded(drag, target: target)
+    }
+
+    private func windowDragEnded(_ drag: WindowDragSession, target: CellID?) {
+        guard model.cell(of: drag.window) == drag.source else { return }
+        guard let target else {
+            logEvent("window drag returned cell=\(drag.source.rawValue)")
+            actualFrames[drag.source] = nil
+            apply(cells: [drag.source])
+            return
+        }
+        logEvent("window drag drop from=\(drag.source.rawValue) to=\(target.rawValue)")
+        invalidateRestore()
+        for affected in model.assign(drag.window, to: target) {
+            actualFrames[affected] = nil
+        }
+        saveLayout()
+        apply(cells: [target, drag.source])
+    }
+
+    private func cancelWindowDrag() {
+        windowDragTimer?.invalidate()
+        windowDragTimer = nil
+        windowDrag = nil
+        swapHighlight.hide()
+    }
+
+    private func pointerLocationInAX() -> CGPoint {
+        let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
+        return ScreenSpace.toAX(CGRect(origin: NSEvent.mouseLocation, size: .zero), primaryHeight: primaryHeight).origin
+    }
+
+    private func appKitFrame(for axFrame: CGRect) -> CGRect {
+        ScreenSpace.fromAX(axFrame, primaryHeight: NSScreen.screens.first?.frame.height ?? 0)
     }
 
     private func beginEdgeResize(_ cell: CellID, _ window: AXWindow, reference: CGRect, current: CGRect) {

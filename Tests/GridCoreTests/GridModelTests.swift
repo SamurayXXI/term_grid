@@ -81,6 +81,28 @@ import Testing
         #expect(grid.bindings[grid.cells[2]] == "c")
     }
 
+    @Test func autoArrangeKeepsWindowsInTheirPreviousOrder() {
+        var grid = model()
+        grid.assign("a", to: CellID(1))
+        grid.assign("b", to: CellID(0))
+        let result = grid.autoArrange(["b", "a"])
+        #expect(result)
+        #expect(grid.bindings[grid.cells[0]] == "b")
+        #expect(grid.bindings[grid.cells[1]] == "a")
+    }
+
+    @Test func autoArrangeKeepsDetachedWindowAtItsPreviousPlace() {
+        var grid = model()
+        grid.assign("a", to: CellID(0))
+        grid.assign("b", to: CellID(1))
+        grid.markDetached(CellID(0))
+        let result = grid.autoArrange(["b", "c", "a"])
+        #expect(result)
+        #expect(grid.bindings[grid.cells[0]] == "a")
+        #expect(grid.bindings[grid.cells[1]] == "b")
+        #expect(grid.bindings[grid.cells[2]] == "c")
+    }
+
     @Test func autoArrangeWithNoWindowsKeepsState() {
         var grid = model()
         grid.assign("a", to: CellID(0))

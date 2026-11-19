@@ -10,5 +10,10 @@ rm -rf "$app"
 mkdir -p "$app/Contents/MacOS"
 cp "$bin_dir/TermGrid" "$app/Contents/MacOS/TermGrid"
 cp "$root/Resources/Info.plist" "$app/Contents/Info.plist"
-codesign --force --sign "${TERMGRID_SIGN_IDENTITY:--}" "$app"
+identity="${TERMGRID_SIGN_IDENTITY:-TermGrid Local Signing}"
+if ! security find-certificate -c "$identity" >/dev/null 2>&1; then
+    echo "warning: signing identity \"$identity\" not found, signing ad-hoc; Accessibility will be lost on every rebuild" >&2
+    identity="-"
+fi
+codesign --force --sign "$identity" "$app"
 echo "$app"
