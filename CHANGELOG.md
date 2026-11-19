@@ -6,6 +6,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-19
+
+### Added
+
+- Drag a window with the mouse onto another cell to swap it with that cell's window, or move it into an empty cell. The target cell is highlighted under the pointer with a translucent blur that does not cover the dragged window.
+
+### Changed
+
+- Dropping a dragged window anywhere other than another cell returns it to its own cell.
+- Local builds are signed with the stable certificate `TermGrid Local Signing` (see the README "Signing" section), so the Accessibility permission survives rebuilds.
+
+### Fixed
+
+- "Lay out automatically" keeps windows in their previous cells instead of shuffling them in discovery order. Detached windows keep their place too.
+
 ## [0.1.0] - 2026-11-18
 
 ### Added
@@ -33,6 +48,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Known issues
 
-- Accessibility permission is lost after every rebuild, because the build is ad-hoc signed. See the README "Signing" section.
+- Accessibility permission is bound to the certificate of the build. A build signed by another certificate, or an ad-hoc build, needs the permission granted again.
 - The app is not signed with a Developer ID and not notarized. Users must open it through the context menu the first time.
 - Stage Manager must be off for windows to stay where TermGrid puts them.
